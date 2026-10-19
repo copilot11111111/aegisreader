@@ -1,0 +1,7 @@
+DEVICE_ID 값과 .dat 파일을 기반으로 복호화
+DEVICE_ID -> .dat 복호화 -> 키 추출 -> 복호화
+
+USER_ID 값으로 datastores/user/{USER_ID}/BOOK_META 경로의 메타 데이터 복호화에 사용함
+
+API 요청시 DEVICE_ID 값을 그대로 query에 노출하고 있으므로 보완 필요
+키 보안이 너무 취약함
