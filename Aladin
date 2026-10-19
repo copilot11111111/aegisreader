@@ -1,0 +1,27 @@
+Aladin.Ebook.Viewer.PC.Drm.*** method를 이용하여 복호화
+DEVICE_ID 하나만 손에 넣으면 바로 뚫려버린다.
+
+***으로 SQLite의 비밀번호를 확인할 수 있고 Device 테이블에 떡하니 device_id가 있다.
+
+import os
+from sqlcipher3 import dbapi2 as sqlite
+
+DB_PATH = os.path.expandvars(r"%APPDATA%\AladinEbookViewer\data")
+KEY = "****" # PASSWORD
+
+conn = sqlite.connect(DB_PATH)
+cursor = conn.cursor()
+
+cursor.execute(f"PRAGMA key = '{KEY}';")
+cursor.execute("PRAGMA cipher_compatibility = 3;")
+
+cursor.execute("SELECT * FROM Device;")
+columns = [desc[0] for desc in cursor.description]
+rows = cursor.fetchall()
+
+for row in rows:
+    print(dict(zip(columns, row)))
+
+conn.close()
+
+완벽한 보안이란 뭘까
