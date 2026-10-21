@@ -1,5 +1,12 @@
-Aladin.Ebook.Viewer.PC.Drm.*** method를 이용하여 복호화
-DEVICE_ID 하나만 손에 넣으면 바로 뚫려버린다.
+Aladin.Ebook.Viewer.PC.Drm.*** method를 이용하면 device id만 알아도 복호화가 가능하다.
+
+의존 없이 복호화 하려면 몇가지 값으로 아래 단계를 밟아야 한다.
+1. xml 파일을 복호화 하기 위한 salt값(device id와 혼합해서 키를 만든다)
+2. 복호화된 rights.xml에서 암호화된 필드를 복호화 하기 위한 키와 IV 값
+3. 복호화된 필드와 device id를 기반으로 소스맵 구축
+4. 소스맵을 기반으로 hmac.new() 하기 위한 키 값 (**-**=**** 라는 의문의 값이였다)
+5. 생성된 키로 ***를 복호화하면 바이너리 값이 나온다. 이를 **에서 **로 잘라낸 hex값
+5번에서 만들어진 hex값으로 각 콘텐츠를 복호화할 수 있다.
 
 ***으로 SQLite의 비밀번호를 확인할 수 있고 Device 테이블에 떡하니 device_id가 있다.
 
@@ -23,5 +30,3 @@ for row in rows:
     print(dict(zip(columns, row)))
 
 conn.close()
-
-완벽한 보안이란 뭘까
