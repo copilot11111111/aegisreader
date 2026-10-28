@@ -14,7 +14,7 @@ P.S.
 
 ## How to
 [GUI]  
-[aegisreader_standalone_windows.exe](https://github.com/copilot11111111/aegisreader/releases/tag/v1.0.0)  
+https://github.com/copilot11111111/aegisreader/releases/latest  
   
 <img width="625" height="646" alt="aegisreader_gui" src="https://github.com/user-attachments/assets/047a926b-9eb8-41f7-ba40-622d6732c484" />
   
