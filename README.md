@@ -13,20 +13,14 @@ P.S.
 > 054424c61e9a924ce8395ed8e978ec64eab4372762727ab6084d104c5a54a93553 (https://getsession.org/)
 
 ## How to
-URL: https://aegisreader.com/  
-[Windows 기준]
+[GUI]  
+[aegisreader_standalone_windows.exe](https://github.com/copilot11111111/aegisreader/releases/tag/v1.0.0)  
+  
+<img width="625" height="646" alt="aegisreader_gui" src="https://github.com/user-attachments/assets/047a926b-9eb8-41f7-ba40-622d6732c484" />
+  
 1. 구매한 전자책 플랫폼 선택 (리디, 예스24, 알라딘 中)
-2. **"경로 복사 후 폴더 선택"** 버튼 클릭
-3. 폴더: 우측 입력란에 **붙여넣기(Ctrl+V)**후 업로드 선택
-4. **"<폴더명>"의 모든 파일을 업로드하시겠습니까?** 팝업 뜨면 "업로드" 선택
-5. Device ID 입력
-6. **복호화 시작** 버튼 클릭
-7. 업로드 및 복호화 완료되면 **다운로드** 클릭
+2. **"파일에서 추출"** 클릭
+3. **"업로드"** 클릭
 
-[Device ID 확인하기]
-1. **복호화 인증 정보 입력** 카드에서 **Device ID 확인하기** 버튼 클릭
-2. 플랫폼 선택 (리디, 예스24, 알라딘 中)
-3. **경로 복사** 클릭
-4. **찾아보기...** 클릭후 파일 이름: 우측 입력란에 **붙여넣기(Ctrl+V)**후 열기 선택
-5. **Device ID 추출하기** 클릭
-6. 목록에서 Device ID 선택후 **선택한 ID 즉시 적용하기** 클릭
+[Web]  
+URL: https://aegisreader.com
