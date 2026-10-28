@@ -41,7 +41,7 @@ class DeviceIdCard extends StatelessWidget {
               const Icon(Icons.vpn_key_rounded, color: AegisReaderTheme.accentColor, size: 18),
               const SizedBox(width: 8),
               const Text(
-                '디바이스 인증 & ID 설정',
+                'Device ID',
                 style: TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.bold,
@@ -74,7 +74,7 @@ class DeviceIdCard extends StatelessWidget {
                   onChanged: onChanged,
                   onSubmitted: onSubmitted,
                   decoration: InputDecoration(
-                    hintText: '디바이스 ID를 입력하거나 우측 [파일에서 추출]을 누르세요',
+                    hintText: 'Device ID를 직접 입력하거나 우측 [파일에서 추출] 버튼을 누르세요',
                     prefixIcon: const Icon(Icons.fingerprint, color: AegisReaderTheme.textMuted, size: 18),
                     contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                     isDense: true,

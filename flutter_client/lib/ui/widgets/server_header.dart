@@ -69,7 +69,7 @@ class ServerHeader extends StatelessWidget {
                     ),
                   ),
                   Text(
-                    'aegisreader API (https://aegisreader.com/api/)',
+                    'https://aegisreader.com/',
                     style: TextStyle(fontSize: 10, color: AegisReaderTheme.textMuted),
                   ),
                 ],
@@ -173,7 +173,7 @@ class ServerHeader extends StatelessWidget {
                   const SizedBox(width: 10),
                   _buildServiceTab('service1', '리디 (RIDI)', serverStatus.service1Active),
                   const SizedBox(width: 8),
-                  _buildServiceTab('service2', '예스24(Yes24)', serverStatus.service2Active),
+                  _buildServiceTab('service2', '예스24 (Yes24)', serverStatus.service2Active),
                   const SizedBox(width: 8),
                   _buildServiceTab('service3', '알라딘 (Aladin)', serverStatus.service3Active),
                 ],
