@@ -112,11 +112,13 @@ class AegisReaderApiService {
   }
 
   /// 3. 설정 파일에서 디바이스 ID 추출
-  /// POST /api/deviceid (multipart: service, file)
+  /// POST /api/deviceid (multipart: service, file, file_wal, file_shm)
   Future<List<ExtractedDevice>> extractDeviceIdFromFile({
     String? rawUrl,
     required String serviceId,
     required String filePath,
+    String? walFilePath,
+    String? shmFilePath,
   }) async {
     final apiUrl = normalizeApiUrl(rawUrl);
     final file = File(filePath);
@@ -124,13 +126,59 @@ class AegisReaderApiService {
       throw Exception('선택한 파일이 존재하지 않습니다: $filePath');
     }
 
-    final formData = FormData.fromMap({
+    final Uint8List fileBytes;
+    try {
+      fileBytes = await file.readAsBytes();
+    } on FileSystemException {
+      rethrow;
+    } catch (e) {
+      throw FileSystemException('파일을 읽을 수 없습니다: $e', file.path);
+    }
+
+    final formMap = <String, dynamic>{
       'service': serviceId,
-      'file': await MultipartFile.fromFile(
-        file.path,
+      'file': MultipartFile.fromBytes(
+        fileBytes,
         filename: p.basename(file.path),
       ),
-    });
+    };
+
+    // 알라딘(service3)의 경우 SQLite WAL(-wal, -shm) 파일이 존재하고 읽기 가능하면 함께 전송하여 커밋되지 않은 최신 Device ID 복원
+    if (serviceId == 'service3') {
+      final targetWalPath = walFilePath ?? '${file.path}-wal';
+      final targetShmPath = shmFilePath ?? '${file.path}-shm';
+      final walFile = File(targetWalPath);
+      final shmFile = File(targetShmPath);
+      try {
+        if (await walFile.exists()) {
+          final walBytes = await walFile.readAsBytes();
+          if (walBytes.isNotEmpty) {
+            formMap['file_wal'] = MultipartFile.fromBytes(
+              walBytes,
+              filename: '${p.basename(file.path)}-wal',
+            );
+          }
+        }
+      } catch (_) {
+        // macOS App Sandbox 또는 SQLite 파일 잠금으로 -wal 접근이 불가능할 경우 본체 파일만으로 진행
+      }
+
+      try {
+        if (await shmFile.exists()) {
+          final shmBytes = await shmFile.readAsBytes();
+          if (shmBytes.isNotEmpty) {
+            formMap['file_shm'] = MultipartFile.fromBytes(
+              shmBytes,
+              filename: '${p.basename(file.path)}-shm',
+            );
+          }
+        }
+      } catch (_) {
+        // -shm 접근 불가 시 안전하게 건너뜀
+      }
+    }
+
+    final formData = FormData.fromMap(formMap);
 
     final response = await _dio.post(
       '$apiUrl/deviceid',

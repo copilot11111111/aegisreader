@@ -74,15 +74,18 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    if (Platform.isMacOS && _selectedService == 'service2') {
+      _selectedService = 'service1';
+    }
     _serverUrlController = TextEditingController(text: 'https://aegisreader.com/api/');
     _deviceIdController = TextEditingController(text: _serviceDeviceIds[_selectedService]);
 
-    // 기본 라이브러리 경로 (리디: library_<UserNo>, 알라딘: Documents 또는 OneDrive\Documents)
+    // 기본 라이브러리 경로 (리디: library_<UserNo>, 알라딘: Documents 또는 books)
     final defaultLibrary = FolderScanner.getDefaultLibraryPath(_selectedService);
     _folderPathController = TextEditingController(text: defaultLibrary);
 
-    final userProfile = Platform.environment['USERPROFILE'] ?? '';
-    final defaultDownload = p.join(userProfile, 'Downloads');
+    final homeDir = FolderScanner.getHomeDirectory();
+    final defaultDownload = p.join(homeDir, 'Downloads');
     _outputDirController = TextEditingController(text: defaultDownload);
 
     // 초기 서버 연결 점검 및 기본 경로 자동 스캔 시도
@@ -123,6 +126,10 @@ class _HomePageState extends State<HomePage> {
   // 2. 서비스 변경 핸들러
   void _onServiceChanged(String newService) {
     if (_selectedService == newService) return;
+    if (!FolderScanner.isServiceSupported(newService)) {
+      _showTopNotification('예스24(Yes24)는 macOS에서 지원되지 않습니다.', isError: true);
+      return;
+    }
 
     // 현재 서비스의 ID 및 상태 저장
     _serviceDeviceIds[_selectedService] = _deviceIdController.text;
@@ -220,7 +227,20 @@ class _HomePageState extends State<HomePage> {
 
   // 5. '파일에서 추출' 버튼 핸들러 (대상 서비스 경로 자동 읽기 및 API 요청)
   Future<void> _extractDeviceIdFromFile() async {
-    final candidatePath = FolderScanner.getDefaultDeviceIdFilePath(_selectedService);
+    if (!FolderScanner.isServiceSupported(_selectedService)) {
+      _showTopNotification('해당 서비스는 현재 운영체제에서 지원되지 않습니다.', isError: true);
+      return;
+    }
+
+    final candidatePath = FolderScanner.getDefaultDeviceIdFilePath(
+      _selectedService,
+      currentLibraryPath: _folderPathController.text.trim(),
+    );
+    if (candidatePath.isEmpty) {
+      _showTopNotification('해당 서비스의 기본 설정 파일 경로를 찾을 수 없습니다.', isError: true);
+      return;
+    }
+
     final file = File(candidatePath);
 
     if (!await file.exists()) {
@@ -231,7 +251,34 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
+    // 알라딘(service3)의 경우 macOS 로컬 sqlite3 CLI로 -wal 병합(TRUNCATE) 선제 시도
+    if (_selectedService == 'service3' && Platform.isMacOS) {
+      await FolderScanner.checkpointSqliteWal(candidatePath);
+    }
+
+    // 파일 접근(읽기) 권한 사전 확인 (macOS App Sandbox 격리 또는 잠금 사전 감지)
+    bool isReadable = false;
+    try {
+      final raf = await file.open(mode: FileMode.read);
+      await raf.close();
+      isReadable = true;
+    } catch (_) {
+      isReadable = false;
+    }
+
+    if (!isReadable) {
+      _showExtractionFailedDialog(
+        candidatePath,
+        reason: Platform.isMacOS
+            ? 'macOS 보안(앱 샌드박스) 정책으로 인해 알라딘 DB 파일에 직접 접근할 수 없습니다.\n'
+              '아래 [파일 직접 선택] 또는 [databases 폴더 선택] 버튼을 눌러 지정해주세요.'
+            : '설정 파일에 접근할 수 없습니다. 프로그램이 실행 중인지 확인하거나 아래 [파일 직접 선택] 버튼을 이용해주세요.',
+      );
+      return;
+    }
+
     setState(() => _isExtractingDeviceId = true);
+
     try {
       final devices = await _apiService.extractDeviceIdFromFile(
         rawUrl: _serverUrlController.text,
@@ -245,7 +292,8 @@ class _HomePageState extends State<HomePage> {
       if (devices.isEmpty) {
         _showExtractionFailedDialog(
           candidatePath,
-          reason: '파일 내에서 유효한 디바이스 ID를 확인할 수 없습니다.',
+          reason: '파일 및 -wal 로그 내에서 유효한 디바이스 ID를 확인할 수 없습니다.\n'
+                  '-wal 로그가 누락되지 않도록 [databases 폴더 선택]을 시도해보세요.',
         );
         return;
       }
@@ -260,10 +308,30 @@ class _HomePageState extends State<HomePage> {
       } else {
         _showSelectDeviceIdDialog(devices);
       }
+    } on FileSystemException catch (e) {
+      if (!mounted) return;
+      setState(() => _isExtractingDeviceId = false);
+      _showExtractionFailedDialog(
+        candidatePath,
+        reason: '파일 접근 권한이 제한되었습니다. 아래 버튼을 눌러 파일 또는 폴더를 선택해주세요.\n($e)',
+      );
     } catch (e) {
       if (!mounted) return;
       setState(() => _isExtractingDeviceId = false);
-      _showExtractionFailedDialog(candidatePath, reason: e.toString());
+      String errorMsg = e.toString();
+      if (e is DioException) {
+        if (e.error is FileSystemException ||
+            errorMsg.contains('PathAccessException') ||
+            errorMsg.contains('Operation not permitted')) {
+          _showExtractionFailedDialog(
+            candidatePath,
+            reason: '파일 접근 권한이 제한되었습니다. 아래 버튼을 눌러 파일 또는 폴더를 선택해주세요.',
+          );
+          return;
+        }
+        errorMsg = e.response?.data?['statusMessage'] ?? e.message ?? e.toString();
+      }
+      _showExtractionFailedDialog(candidatePath, reason: errorMsg);
     }
   }
 
@@ -276,11 +344,11 @@ class _HomePageState extends State<HomePage> {
           children: [
             Icon(Icons.warning_amber_rounded, color: AegisReaderTheme.warningColor, size: 22),
             SizedBox(width: 8),
-            Text('추출하지 못했습니다', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+            Text('디바이스 ID 추출 안내', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
           ],
         ),
         content: SizedBox(
-          width: 440,
+          width: 460,
           child: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -291,7 +359,7 @@ class _HomePageState extends State<HomePage> {
                   const SizedBox(height: 10),
                 ],
                 const Text(
-                  '확인한 파일 경로:',
+                  '확인 대상 경로:',
                   style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: AegisReaderTheme.textMuted),
                 ),
                 const SizedBox(height: 6),
@@ -309,12 +377,14 @@ class _HomePageState extends State<HomePage> {
                   ),
                 ),
                 const SizedBox(height: 10),
-                const Text(
-                  '• 리디: %appdata%\\Ridibooks\\sentry\\scope_v2.json\n'
-                  '• 예스24: %appdata%\\Yes24eBook\\.db\\Yes24eBook.realm\n'
-                  '• 알라딘: %appdata%\\AladinEbookViewer\\data\n\n'
-                  '해당 리더기 프로그램이 설치되어 있고 최소 1회 이상 로그인되었는지 확인해주세요.',
-                  style: TextStyle(fontSize: 11, color: AegisReaderTheme.textMuted, height: 1.4),
+                Text(
+                  Platform.isMacOS
+                      ? '• 알라딘 최신 디바이스 정보는 NewCrema.sqlite와 -wal 파일에 저장됩니다.\n'
+                        '• -wal 파일까지 함께 권한을 부여하려면 [databases 폴더 선택]을 추천합니다.'
+                      : '• 리디: %appdata%\\Ridibooks\\sentry\\scope_v2.json\n'
+                        '• 예스24: %appdata%\\Yes24eBook\\.db\\Yes24eBook.realm\n'
+                        '• 알라딘: %appdata%\\AladinEbookViewer\\data',
+                  style: const TextStyle(fontSize: 11, color: AegisReaderTheme.textMuted, height: 1.4),
                 ),
               ],
             ),
@@ -322,44 +392,217 @@ class _HomePageState extends State<HomePage> {
         ),
         actions: [
           TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('닫기'),
+          ),
+          if (Platform.isMacOS && _selectedService == 'service3')
+            OutlinedButton.icon(
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                _manualPickFolderForDeviceId();
+              },
+              icon: const Icon(Icons.folder, size: 16),
+              label: const Text('databases 폴더 선택'),
+            ),
+          ElevatedButton.icon(
             onPressed: () {
               Navigator.of(ctx).pop();
               _manualPickFileForDeviceId();
             },
-            child: const Text('다른 위치 파일 직접 선택'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('확인'),
+            icon: const Icon(Icons.file_open, size: 16),
+            label: const Text('파일 직접 선택'),
           ),
         ],
       ),
     );
   }
 
-  // 보조: 사용자가 다른 위치 파일을 직접 선택
+  // 보조 1: 사용자가 파일(들)을 직접 선택
   Future<void> _manualPickFileForDeviceId() async {
     try {
+      String? initialDir;
+      if (Platform.isMacOS && _selectedService == 'service3') {
+        final libPath = _folderPathController.text.trim();
+        if (libPath.isNotEmpty) {
+          final resolved = FolderScanner.resolveEnvironmentPath(libPath);
+          final dbDir = p.join(p.dirname(resolved), 'databases');
+          if (Directory(dbDir).existsSync()) {
+            initialDir = dbDir;
+          }
+        }
+        if (initialDir == null) {
+          final defaultDb = FolderScanner.getDefaultDeviceIdFilePath(_selectedService);
+          if (defaultDb.isNotEmpty) {
+            final parent = p.dirname(defaultDb);
+            if (Directory(parent).existsSync()) {
+              initialDir = parent;
+            }
+          }
+        }
+      }
+
       final result = await FilePicker.platform.pickFiles(
-        dialogTitle: '디바이스 설정/DB 파일 선택',
+        dialogTitle: '디바이스 설정/DB 파일 선택 (NewCrema.sqlite 및 -wal)',
         type: FileType.any,
+        initialDirectory: initialDir,
+        allowMultiple: true,
       );
 
-      if (result == null || result.files.single.path == null) return;
-      final filePath = result.files.single.path!;
+      if (result == null || result.files.isEmpty) return;
+
+      String? primaryPath;
+      String? walPath;
+      String? shmPath;
+
+      for (final f in result.files) {
+        final pth = f.path;
+        if (pth == null) continue;
+        if (pth.endsWith('-wal')) {
+          walPath = pth;
+        } else if (pth.endsWith('-shm')) {
+          shmPath = pth;
+        } else if (pth.endsWith('.sqlite') || pth.endsWith('data') || pth.endsWith('.json') || pth.endsWith('.realm')) {
+          primaryPath = pth;
+        } else {
+          primaryPath ??= pth;
+        }
+      }
+
+      final filePath = primaryPath ?? result.files.first.path!;
 
       setState(() => _isExtractingDeviceId = true);
+
+      // 알라딘(service3)의 경우 macOS 로컬 내장 sqlite3 CLI로 -wal 병합(TRUNCATE) 실행 후 API 호출
+      if (_selectedService == 'service3' && Platform.isMacOS) {
+        await FolderScanner.checkpointSqliteWal(filePath);
+      }
+
       final devices = await _apiService.extractDeviceIdFromFile(
         rawUrl: _serverUrlController.text,
         serviceId: _selectedService,
         filePath: filePath,
+        walFilePath: walPath,
+        shmFilePath: shmPath,
       );
 
       if (!mounted) return;
       setState(() => _isExtractingDeviceId = false);
 
       if (devices.isEmpty) {
-        _showExtractionFailedDialog(filePath, reason: '선택한 파일에서 디바이스 ID를 찾을 수 없습니다.');
+        _showExtractionFailedDialog(
+          filePath,
+          reason: '선택한 파일에서 유효한 디바이스 ID를 찾을 수 없습니다.\n'
+                  '-wal 파일이 누락되었을 수 있으니 [databases 폴더 선택]을 이용해보세요.',
+        );
+        return;
+      }
+
+      if (devices.length == 1) {
+        final extractedId = devices.first.deviceId;
+        _deviceIdController.text = extractedId;
+        _serviceDeviceIds[_selectedService] = extractedId;
+        _showTopNotification('디바이스 ID 추출 성공: $extractedId');
+        _checkDeviceId(silent: true);
+      } else {
+        _showSelectDeviceIdDialog(devices);
+      }
+    } on FileSystemException catch (e) {
+      if (!mounted) return;
+      setState(() => _isExtractingDeviceId = false);
+      _showExtractionFailedDialog(
+        '',
+        reason: '파일 접근 권한이 제한되었습니다 ($e).\nmacOS 시스템 설정 > 개인정보 보호 및 보안 > 전체 디스크 접근 권한을 확인해주세요.',
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _isExtractingDeviceId = false);
+      String errorMsg = e.toString();
+      if (e is DioException) {
+        if (e.error is FileSystemException ||
+            errorMsg.contains('PathAccessException') ||
+            errorMsg.contains('Operation not permitted')) {
+          _showExtractionFailedDialog(
+            '',
+            reason: '파일 접근 권한이 제한되었습니다. 다른 위치의 파일을 선택해주세요.',
+          );
+          return;
+        }
+        errorMsg = e.response?.data?['statusMessage'] ?? e.message ?? e.toString();
+      }
+      _showExtractionFailedDialog('', reason: errorMsg);
+    }
+  }
+
+  // 보조 2: macOS 알라딘 databases 폴더 전체를 선택하여 -wal, -shm까지 동시 권한 획득
+  Future<void> _manualPickFolderForDeviceId() async {
+    try {
+      String? initialDir;
+      if (Platform.isMacOS && _selectedService == 'service3') {
+        final libPath = _folderPathController.text.trim();
+        if (libPath.isNotEmpty) {
+          final resolved = FolderScanner.resolveEnvironmentPath(libPath);
+          final dbDir = p.join(p.dirname(resolved), 'databases');
+          if (Directory(dbDir).existsSync()) {
+            initialDir = dbDir;
+          }
+        }
+        if (initialDir == null) {
+          final defaultDb = FolderScanner.getDefaultDeviceIdFilePath(_selectedService);
+          if (defaultDb.isNotEmpty) {
+            final parent = p.dirname(defaultDb);
+            if (Directory(parent).existsSync()) {
+              initialDir = parent;
+            }
+          }
+        }
+      }
+
+      final selectedDir = await FilePicker.platform.getDirectoryPath(
+        dialogTitle: '알라딘 databases 폴더 선택',
+        initialDirectory: initialDir,
+      );
+
+      if (selectedDir == null) return;
+
+      final sqliteFile = File(p.join(selectedDir, 'NewCrema.sqlite'));
+      final dataFile = File(p.join(selectedDir, 'data'));
+      final targetFile = sqliteFile.existsSync() ? sqliteFile : (dataFile.existsSync() ? dataFile : null);
+
+      if (targetFile == null) {
+        _showExtractionFailedDialog(
+          selectedDir,
+          reason: '선택한 폴더 안에 NewCrema.sqlite 파일이 존재하지 않습니다.',
+        );
+        return;
+      }
+
+      setState(() => _isExtractingDeviceId = true);
+
+      final filePath = targetFile.path;
+      final walFile = File('$filePath-wal');
+      final shmFile = File('$filePath-shm');
+
+      // 로컬 체크포인트 시도
+      if (Platform.isMacOS) {
+        await FolderScanner.checkpointSqliteWal(filePath);
+      }
+
+      final devices = await _apiService.extractDeviceIdFromFile(
+        rawUrl: _serverUrlController.text,
+        serviceId: _selectedService,
+        filePath: filePath,
+        walFilePath: walFile.existsSync() ? walFile.path : null,
+        shmFilePath: shmFile.existsSync() ? shmFile.path : null,
+      );
+
+      if (!mounted) return;
+      setState(() => _isExtractingDeviceId = false);
+
+      if (devices.isEmpty) {
+        _showExtractionFailedDialog(
+          filePath,
+          reason: '선택한 폴더의 DB 및 -wal 로그에서 유효한 디바이스 ID를 찾을 수 없습니다.',
+        );
         return;
       }
 
@@ -765,7 +1008,7 @@ class _HomePageState extends State<HomePage> {
 
           final tempZipPath = p.join(
             Directory.systemTemp.path,
-            'aegisreader_${DateTime.now().millisecondsSinceEpoch}_${p.basename(book.path)}.zip',
+            '${p.basename(book.path)}.zip',
           );
           tempZipFile = File(tempZipPath);
 

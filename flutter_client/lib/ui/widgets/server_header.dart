@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import '../../models/server_status.dart';
 import '../theme.dart';
@@ -173,7 +174,13 @@ class ServerHeader extends StatelessWidget {
                   const SizedBox(width: 10),
                   _buildServiceTab('service1', '리디 (RIDI)', serverStatus.service1Active),
                   const SizedBox(width: 8),
-                  _buildServiceTab('service2', '예스24 (Yes24)', serverStatus.service2Active),
+                  _buildServiceTab(
+                    'service2',
+                    '예스24 (Yes24)',
+                    serverStatus.service2Active,
+                    enabled: !Platform.isMacOS,
+                    disabledReason: '미지원',
+                  ),
                   const SizedBox(width: 8),
                   _buildServiceTab('service3', '알라딘 (Aladin)', serverStatus.service3Active),
                 ],
@@ -225,12 +232,17 @@ class ServerHeader extends StatelessWidget {
     );
   }
 
-  Widget _buildServiceTab(String serviceId, String label, bool active) {
+  Widget _buildServiceTab(
+    String serviceId,
+    String label,
+    bool active, {
+    bool enabled = true,
+    String? disabledReason,
+  }) {
     final isSelected = selectedService == serviceId;
 
-    return InkWell(
-      onTap: () => onServiceChanged(serviceId),
-      borderRadius: BorderRadius.circular(8),
+    final child = Opacity(
+      opacity: enabled ? 1.0 : 0.45,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         decoration: BoxDecoration(
@@ -254,7 +266,24 @@ class ServerHeader extends StatelessWidget {
                 color: isSelected ? Colors.white : AegisReaderTheme.textMuted,
               ),
             ),
-            if (!active && serverStatus.online) ...[
+            if (!enabled && disabledReason != null) ...[
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  disabledReason,
+                  style: const TextStyle(
+                    fontSize: 9,
+                    color: AegisReaderTheme.textMuted,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ] else if (!active && serverStatus.online) ...[
               const SizedBox(width: 6),
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
@@ -275,6 +304,19 @@ class ServerHeader extends StatelessWidget {
           ],
         ),
       ),
+    );
+
+    if (!enabled) {
+      return Tooltip(
+        message: 'macOS에서는 지원되지 않는 서비스입니다.',
+        child: child,
+      );
+    }
+
+    return InkWell(
+      onTap: () => onServiceChanged(serviceId),
+      borderRadius: BorderRadius.circular(8),
+      child: child,
     );
   }
 }
