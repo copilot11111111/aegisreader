@@ -82,14 +82,12 @@ class FolderScanner {
   /// 서비스별 Device ID 파일 경로 추천 (우선순위 순서)
   static String getDefaultDeviceIdFilePath(String serviceId) {
     final appData = Platform.environment['APPDATA'] ?? '';
-    final userProfile = Platform.environment['USERPROFILE'] ?? '';
 
     switch (serviceId) {
       case 'service1': // 리디: %appdata%\Ridibooks\sentry\scope_v2.json
         final candidates = [
           p.join(appData, 'Ridibooks', 'sentry', 'scope_v2.json'),
           p.join(appData, 'Ridibooks', 'scope_v2.json'),
-          p.join(appData, 'Ridi', 'sentry', 'scope_v2.json'),
         ];
         for (final c in candidates) {
           if (File(c).existsSync()) return c;
@@ -109,9 +107,7 @@ class FolderScanner {
       case 'service3': // 알라딘: %appdata%\AladinEbookViewer\data
         final candidates = [
           p.join(appData, 'AladinEbookViewer', 'data'),
-          p.join(userProfile, 'OneDrive', '문서', 'AladinEbookViewer', 'data'),
-		  p.join(userProfile, 'OneDrive', 'Documents', 'AladinEbookViewer', 'data'),
-          p.join(userProfile, 'Documents', 'AladinEbookViewer', 'data'),
+          p.join(appData, 'AladinEbookViewer', 'NewCrema.sqlite'),
         ];
         for (final c in candidates) {
           if (File(c).existsSync()) return c;

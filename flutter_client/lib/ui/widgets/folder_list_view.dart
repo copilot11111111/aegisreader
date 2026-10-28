@@ -57,7 +57,7 @@ class FolderListView extends StatelessWidget {
                     const Icon(Icons.folder_copy_rounded, color: AppTheme.accentColor, size: 18),
                     const SizedBox(width: 8),
                     const Text(
-                      '도서 보관 라이브러리 폴더',
+                      '도서 라이브러리 폴더',
                       style: TextStyle(
                         fontSize: 14,
                         fontWeight: FontWeight.bold,

@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 import '../models/book_item.dart';
 import '../models/server_status.dart';
 import '../models/device_status.dart';
+import '../models/extracted_device.dart';
 import '../services/api_service.dart';
 import '../services/folder_scanner.dart';
 import '../services/zip_service.dart';
@@ -232,7 +233,7 @@ class _HomePageState extends State<HomePage> {
 
     setState(() => _isExtractingDeviceId = true);
     try {
-      final ids = await _apiService.extractDeviceIdFromFile(
+      final devices = await _apiService.extractDeviceIdFromFile(
         rawUrl: _serverUrlController.text,
         serviceId: _selectedService,
         filePath: file.path,
@@ -241,7 +242,7 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) return;
       setState(() => _isExtractingDeviceId = false);
 
-      if (ids.isEmpty) {
+      if (devices.isEmpty) {
         _showExtractionFailedDialog(
           candidatePath,
           reason: '파일 내에서 유효한 디바이스 ID를 확인할 수 없습니다.',
@@ -249,15 +250,15 @@ class _HomePageState extends State<HomePage> {
         return;
       }
 
-      if (ids.length == 1) {
-        final extractedId = ids.first;
+      if (devices.length == 1) {
+        final extractedId = devices.first.deviceId;
         _deviceIdController.text = extractedId;
         _serviceDeviceIds[_selectedService] = extractedId;
         _showTopNotification('디바이스 ID 자동 추출 성공: $extractedId');
         // 추출 즉시 서버에 유효성 및 쿼터 확인 자동 실행
         _checkDeviceId(silent: true);
       } else {
-        _showSelectDeviceIdDialog(ids);
+        _showSelectDeviceIdDialog(devices);
       }
     } catch (e) {
       if (!mounted) return;
@@ -348,7 +349,7 @@ class _HomePageState extends State<HomePage> {
       final filePath = result.files.single.path!;
 
       setState(() => _isExtractingDeviceId = true);
-      final ids = await _apiService.extractDeviceIdFromFile(
+      final devices = await _apiService.extractDeviceIdFromFile(
         rawUrl: _serverUrlController.text,
         serviceId: _selectedService,
         filePath: filePath,
@@ -357,19 +358,19 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) return;
       setState(() => _isExtractingDeviceId = false);
 
-      if (ids.isEmpty) {
+      if (devices.isEmpty) {
         _showExtractionFailedDialog(filePath, reason: '선택한 파일에서 디바이스 ID를 찾을 수 없습니다.');
         return;
       }
 
-      if (ids.length == 1) {
-        final extractedId = ids.first;
+      if (devices.length == 1) {
+        final extractedId = devices.first.deviceId;
         _deviceIdController.text = extractedId;
         _serviceDeviceIds[_selectedService] = extractedId;
         _showTopNotification('디바이스 ID 추출 성공: $extractedId');
         _checkDeviceId(silent: true);
       } else {
-        _showSelectDeviceIdDialog(ids);
+        _showSelectDeviceIdDialog(devices);
       }
     } catch (e) {
       if (!mounted) return;
@@ -379,7 +380,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   // 다중 디바이스 ID 선택 다이얼로그 (시인성 높은 V 선택 버튼 적용)
-  void _showSelectDeviceIdDialog(List<String> ids) {
+  void _showSelectDeviceIdDialog(List<ExtractedDevice> devices) {
     showDialog(
       context: context,
       barrierDismissible: true,
@@ -403,7 +404,12 @@ class _HomePageState extends State<HomePage> {
                   style: TextStyle(fontSize: 12, color: AegisReaderTheme.textMuted, height: 1.4),
                 ),
                 const SizedBox(height: 14),
-                ...ids.map((id) {
+                ...devices.map((device) {
+                  final id = device.deviceId;
+                  final name = device.deviceName.trim();
+                  final isAladin = _selectedService == 'service3';
+                  // 알라딘이고 디바이스 ID가 여러 개인 경우에만 deviceName 노출 (1개인 경우 미노출)
+                  final showDeviceName = isAladin && devices.length > 1 && name.isNotEmpty;
                   final isAladinHwId = id.startsWith('al');
                   return Container(
                     margin: const EdgeInsets.only(bottom: 10),
@@ -418,7 +424,9 @@ class _HomePageState extends State<HomePage> {
                         _deviceIdController.text = id;
                         _serviceDeviceIds[_selectedService] = id;
                         Navigator.of(ctx).pop();
-                        _showTopNotification('디바이스 ID 선택 완료: $id');
+                        _showTopNotification(
+                          showDeviceName ? '디바이스 ID 선택 완료: $name ($id)' : '디바이스 ID 선택 완료: $id',
+                        );
                         _checkDeviceId(silent: true);
                       },
                       child: Padding(
@@ -451,26 +459,63 @@ class _HomePageState extends State<HomePage> {
                                       color: AegisReaderTheme.textPrimary,
                                     ),
                                   ),
-                                  const SizedBox(height: 4),
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                    decoration: BoxDecoration(
-                                      color: (isAladinHwId
-                                              ? AegisReaderTheme.warningColor
-                                              : AegisReaderTheme.secondaryColor)
-                                          .withOpacity(0.15),
-                                      borderRadius: BorderRadius.circular(4),
-                                    ),
-                                    child: Text(
-                                      isAladinHwId ? '알라딘 전용 하드웨어 ID' : '표준 디바이스 고유 UUID',
-                                      style: TextStyle(
-                                        fontSize: 10,
-                                        fontWeight: FontWeight.w600,
-                                        color: isAladinHwId
-                                            ? AegisReaderTheme.warningColor
-                                            : AegisReaderTheme.secondaryColor,
+                                  const SizedBox(height: 5),
+                                  Wrap(
+                                    spacing: 6,
+                                    runSpacing: 4,
+                                    children: [
+                                      if (showDeviceName)
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                          decoration: BoxDecoration(
+                                            color: AegisReaderTheme.accentColor.withOpacity(0.18),
+                                            borderRadius: BorderRadius.circular(4),
+                                            border: Border.all(
+                                              color: AegisReaderTheme.accentColor.withOpacity(0.4),
+                                              width: 0.8,
+                                            ),
+                                          ),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              const Icon(
+                                                Icons.devices_rounded,
+                                                size: 11,
+                                                color: AegisReaderTheme.accentColor,
+                                              ),
+                                              const SizedBox(width: 4),
+                                              Text(
+                                                name,
+                                                style: const TextStyle(
+                                                  fontSize: 10,
+                                                  fontWeight: FontWeight.bold,
+                                                  color: AegisReaderTheme.accentColor,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                        decoration: BoxDecoration(
+                                          color: (isAladinHwId
+                                                  ? AegisReaderTheme.warningColor
+                                                  : AegisReaderTheme.secondaryColor)
+                                              .withOpacity(0.15),
+                                          borderRadius: BorderRadius.circular(4),
+                                        ),
+                                        child: Text(
+                                          isAladinHwId ? '알라딘 전용 하드웨어 ID' : '표준 디바이스 고유 UUID',
+                                          style: TextStyle(
+                                            fontSize: 10,
+                                            fontWeight: FontWeight.w600,
+                                            color: isAladinHwId
+                                                ? AegisReaderTheme.warningColor
+                                                : AegisReaderTheme.secondaryColor,
+                                          ),
+                                        ),
                                       ),
-                                    ),
+                                    ],
                                   ),
                                 ],
                               ),
@@ -482,7 +527,9 @@ class _HomePageState extends State<HomePage> {
                                 _deviceIdController.text = id;
                                 _serviceDeviceIds[_selectedService] = id;
                                 Navigator.of(ctx).pop();
-                                _showTopNotification('디바이스 ID 선택 완료: $id');
+                                _showTopNotification(
+                                  showDeviceName ? '디바이스 ID 선택 완료: $name ($id)' : '디바이스 ID 선택 완료: $id',
+                                );
                                 _checkDeviceId(silent: true);
                               },
                               icon: const Icon(
@@ -755,11 +802,20 @@ class _HomePageState extends State<HomePage> {
           datFilePath: book.datFilePath,
           removeWatermark: _removeWatermark,
           cancelToken: _currentCancelToken,
+          onStatusUpdate: (msg) {
+            if (mounted) {
+              setState(() {
+                book.statusMessage = msg;
+              });
+            }
+          },
           onSendProgress: (sent, total) {
             if (mounted && total > 0) {
               setState(() {
-                book.progress = sent / total;
-                book.statusMessage = '업로드 중 ${(sent / (1024 * 1024)).toStringAsFixed(1)}MB';
+                book.progress = (sent / total).clamp(0.0, 1.0);
+                if (total <= AegisReaderApiService.splitThresholdBytes) {
+                  book.statusMessage = '업로드 중 ${(sent / (1024 * 1024)).toStringAsFixed(1)}MB';
+                }
               });
             }
           },

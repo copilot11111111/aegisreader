@@ -1,8 +1,11 @@
 import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
 import 'package:dio/dio.dart';
 import 'package:path/path.dart' as p;
 import '../models/server_status.dart';
 import '../models/device_status.dart';
+import '../models/extracted_device.dart';
 
 class DecryptedFileResult {
   final String token;
@@ -29,6 +32,12 @@ class DecryptedFileResult {
 
 class AegisReaderApiService {
   static const String defaultApiUrl = 'https://aegisreader.com/api';
+
+  /// 분할 업로드 기준 파일 크기 (100MB 초과 도서 대상, HTTP 프록시 단일 요청 제한 100MB 및 헤더 마진을 감안하여 95MB 초과 시 자동 분할)
+  static const int splitThresholdBytes = 95 * 1024 * 1024;
+
+  /// 분할 청크 단위 크기 (50MB)
+  static const int chunkSizeBytes = 50 * 1024 * 1024;
 
   final Dio _dio = Dio(BaseOptions(
     connectTimeout: const Duration(seconds: 15),
@@ -104,7 +113,7 @@ class AegisReaderApiService {
 
   /// 3. 설정 파일에서 디바이스 ID 추출
   /// POST /api/deviceid (multipart: service, file)
-  Future<List<String>> extractDeviceIdFromFile({
+  Future<List<ExtractedDevice>> extractDeviceIdFromFile({
     String? rawUrl,
     required String serviceId,
     required String filePath,
@@ -129,11 +138,21 @@ class AegisReaderApiService {
     );
 
     if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
+      final rawDevices = response.data['devices'] as List<dynamic>?;
+      if (rawDevices != null && rawDevices.isNotEmpty) {
+        return rawDevices
+            .whereType<Map<String, dynamic>>()
+            .map((e) => ExtractedDevice.fromJson(e))
+            .where((d) => d.deviceId.isNotEmpty)
+            .toList();
+      }
+
       final ids = (response.data['deviceIds'] as List<dynamic>?)
               ?.map((e) => e.toString())
+              .where((id) => id.isNotEmpty)
               .toList() ??
           [];
-      return ids;
+      return ids.map((id) => ExtractedDevice(deviceId: id)).toList();
     } else {
       final msg = response.data?['statusMessage'] ?? 'Device ID 추출 실패';
       throw Exception(msg);
@@ -142,6 +161,7 @@ class AegisReaderApiService {
 
   /// 4. 도서 파일 복호화 요청
   /// POST /api/decrypt (multipart: service, deviceId, files, datFiles, removeWatermark)
+  /// 100MB 초과 도서의 경우 단일 요청 100MB 제한을 방어하기 위해 자동으로 50MB 단위 분할 업로드(Chunked Upload) 수행
   Future<List<DecryptedFileResult>> decryptBook({
     String? rawUrl,
     required String serviceId,
@@ -150,6 +170,7 @@ class AegisReaderApiService {
     String? datFilePath,
     bool removeWatermark = false,
     ProgressCallback? onSendProgress,
+    void Function(String message)? onStatusUpdate,
     CancelToken? cancelToken,
   }) async {
     final apiUrl = normalizeApiUrl(rawUrl);
@@ -158,45 +179,197 @@ class AegisReaderApiService {
       throw Exception('업로드할 도서 파일이 존재하지 않습니다: $filePath');
     }
 
-    final formMap = <String, dynamic>{
-      'service': serviceId,
-      'deviceId': deviceId.trim(),
-      'removeWatermark': removeWatermark ? 'true' : 'false',
-      'files': await MultipartFile.fromFile(
-        bookFile.path,
-        filename: p.basename(bookFile.path),
-      ),
-    };
+    final fileLength = await bookFile.length();
 
-    if (datFilePath != null && datFilePath.isNotEmpty) {
-      final datFile = File(datFilePath);
-      if (await datFile.exists()) {
-        formMap['datFiles'] = await MultipartFile.fromFile(
-          datFile.path,
-          filename: p.basename(datFile.path),
-        );
+    // 100MB 이하: 기존 단일 multipart 업로드
+    if (fileLength <= splitThresholdBytes) {
+      onStatusUpdate?.call('업로드 중...');
+      final formMap = <String, dynamic>{
+        'service': serviceId,
+        'deviceId': deviceId.trim(),
+        'removeWatermark': removeWatermark ? 'true' : 'false',
+        'files': await MultipartFile.fromFile(
+          bookFile.path,
+          filename: p.basename(bookFile.path),
+        ),
+      };
+
+      if (datFilePath != null && datFilePath.isNotEmpty) {
+        final datFile = File(datFilePath);
+        if (await datFile.exists()) {
+          formMap['datFiles'] = await MultipartFile.fromFile(
+            datFile.path,
+            filename: p.basename(datFile.path),
+          );
+        }
+      }
+
+      final formData = FormData.fromMap(formMap);
+
+      final response = await _dio.post(
+        '$apiUrl/decrypt',
+        data: formData,
+        onSendProgress: (sent, total) {
+          onSendProgress?.call(sent, total);
+          if (total > 0 && sent >= total) {
+            onStatusUpdate?.call('서버에서 복호화 진행 중...');
+          }
+        },
+        cancelToken: cancelToken,
+      );
+
+      if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
+        if (response.data['success'] != true) {
+          final msg = response.data['statusMessage'] ?? '복호화 실패';
+          throw Exception(msg);
+        }
+        final list = (response.data['files'] as List<dynamic>?)
+                ?.map((e) => DecryptedFileResult.fromJson(e as Map<String, dynamic>))
+                .toList() ??
+            [];
+        return list;
+      } else {
+        final msg = response.data?['statusMessage'] ?? '복호화 실패';
+        throw Exception(msg);
       }
     }
 
-    final formData = FormData.fromMap(formMap);
-
-    final response = await _dio.post(
-      '$apiUrl/decrypt',
-      data: formData,
-      onSendProgress: onSendProgress,
-      cancelToken: cancelToken,
-    );
-
-    if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
-      final list = (response.data['files'] as List<dynamic>?)
-              ?.map((e) => DecryptedFileResult.fromJson(e as Map<String, dynamic>))
-              .toList() ??
-          [];
-      return list;
-    } else {
-      final msg = response.data?['statusMessage'] ?? '복호화 실패';
-      throw Exception(msg);
+    // 100MB 초과: 분할 청크 업로드 (isSplit: true, isRawChunk: true)
+    int totalChunks = (fileLength / chunkSizeBytes).ceil();
+    if (totalChunks < 2) {
+      totalChunks = 2;
     }
+    final uploadId = 'up_${DateTime.now().millisecondsSinceEpoch}_${Random().nextInt(900000) + 100000}';
+    final originalFileName = p.basename(bookFile.path);
+
+    Uint8List? datBytes;
+    String? datFileName;
+    if (datFilePath != null && datFilePath.isNotEmpty) {
+      final datFile = File(datFilePath);
+      if (await datFile.exists()) {
+        datBytes = await datFile.readAsBytes();
+        datFileName = p.basename(datFile.path);
+      }
+    }
+
+    for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      if (cancelToken?.isCancelled == true) {
+        throw DioException(
+          requestOptions: RequestOptions(path: '$apiUrl/decrypt'),
+          type: DioExceptionType.cancel,
+          message: '사용자에 의해 분할 업로드가 취소되었습니다.',
+        );
+      }
+
+      final startOffset = chunkIndex * chunkSizeBytes;
+      final endOffset = min(startOffset + chunkSizeBytes, fileLength);
+      final currentChunkSize = endOffset - startOffset;
+
+      final isFinalChunk = (chunkIndex == totalChunks - 1);
+
+      final startMb = (startOffset / (1024 * 1024)).toStringAsFixed(1);
+      final chunkSizeMb = (currentChunkSize / (1024 * 1024)).toStringAsFixed(1);
+      final totalMb = (fileLength / (1024 * 1024)).toStringAsFixed(1);
+
+      onStatusUpdate?.call(
+        '분할 업로드 중 [${chunkIndex + 1}/$totalChunks] 0.0 / $chunkSizeMb MB (전체 $startMb / $totalMb MB)',
+      );
+
+      final formMap = <String, dynamic>{
+        'service': serviceId,
+        'deviceId': deviceId.trim(),
+        'removeWatermark': removeWatermark ? 'true' : 'false',
+        'isSplit': 'true',
+        'isRawChunk': 'true',
+        'uploadId': uploadId,
+        'chunkIndex': chunkIndex.toString(),
+        'totalChunks': totalChunks.toString(),
+        'originalFileName': originalFileName,
+        'originalFileSize': fileLength.toString(),
+        'files': MultipartFile.fromStream(
+          () => bookFile.openRead(startOffset, endOffset),
+          currentChunkSize,
+          filename: '$originalFileName.part_$chunkIndex',
+        ),
+      };
+
+      if (datBytes != null && datFileName != null) {
+        formMap['datFiles'] = MultipartFile.fromBytes(
+          datBytes,
+          filename: datFileName,
+        );
+      }
+
+      final formData = FormData.fromMap(formMap);
+
+      DateTime lastUiUpdate = DateTime.now();
+
+      final response = await _dio.post(
+        '$apiUrl/decrypt',
+        data: formData,
+        options: Options(
+          sendTimeout: const Duration(minutes: 5),
+          receiveTimeout: isFinalChunk ? const Duration(minutes: 10) : const Duration(minutes: 3),
+        ),
+        cancelToken: cancelToken,
+        onSendProgress: (sent, total) {
+          final double chunkFraction = (total > 0) ? (sent / total).clamp(0.0, 1.0) : 0.0;
+          final int chunkSent = min(currentChunkSize, (currentChunkSize * chunkFraction).round());
+          final int overallSent = min(fileLength, startOffset + chunkSent);
+
+          onSendProgress?.call(overallSent, fileLength);
+
+          if (isFinalChunk && sent >= total) {
+            onStatusUpdate?.call('서버에서 청크 재조립 및 복호화 진행 중...');
+            return;
+          }
+
+          final now = DateTime.now();
+          if (sent >= total || now.difference(lastUiUpdate).inMilliseconds >= 50) {
+            lastUiUpdate = now;
+            final chunkSentMb = (chunkSent / (1024 * 1024)).toStringAsFixed(1);
+            final overallSentMb = (overallSent / (1024 * 1024)).toStringAsFixed(1);
+            onStatusUpdate?.call(
+              '분할 업로드 중 [${chunkIndex + 1}/$totalChunks] $chunkSentMb / $chunkSizeMb MB (전체 $overallSentMb / $totalMb MB)',
+            );
+          }
+        },
+      );
+
+      if (!isFinalChunk) {
+        if (response.statusCode != 200 ||
+            response.data is! Map<String, dynamic> ||
+            response.data['success'] != true) {
+          final msg = (response.data is Map<String, dynamic>)
+              ? response.data['statusMessage']
+              : '청크 [${chunkIndex + 1}/$totalChunks] 전송 실패';
+          throw Exception(msg ?? '청크 전송 실패');
+        }
+      } else {
+        // 최종 청크 전송 완료 및 복호화 결과 수신
+        if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
+          if (response.data['success'] != true) {
+            final msg = response.data['statusMessage'] ?? '복호화 실패';
+            throw Exception(msg);
+          }
+          final list = (response.data['files'] as List<dynamic>?)
+                  ?.map((e) => DecryptedFileResult.fromJson(e as Map<String, dynamic>))
+                  .toList() ??
+              [];
+          if (list.isEmpty) {
+            throw Exception('서버에서 복호화 완료 파일을 반환하지 않았습니다.');
+          }
+          return list;
+        } else {
+          final msg = (response.data is Map<String, dynamic>)
+              ? response.data['statusMessage']
+              : '복호화 실패';
+          throw Exception(msg ?? '복호화 실패');
+        }
+      }
+    }
+
+    throw Exception('분할 업로드 처리가 비정상적으로 완료되었습니다.');
   }
 
   /// 5. 복호화 완료 파일 다운로드
