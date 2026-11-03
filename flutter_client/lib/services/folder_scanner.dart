@@ -335,25 +335,50 @@ class FolderScanner {
     }
   }
 
+  /// OPF XML 문자열에서 도서 제목(dc:title) 파싱 (CDATA 언래핑 및 엔티티 복원)
+  static String? parseDcTitle(String content) {
+    final match = RegExp(
+      r'<(?:dc:)?title(?:\s[^>]*)?>([\s\S]*?)<\/(?:dc:)?title>',
+      caseSensitive: false,
+    ).firstMatch(content);
+    if (match != null && match.group(1) != null) {
+      String title = match.group(1)!;
+
+      // 1. CDATA 언래핑: <![CDATA[...]]> 내부 원본 문자열 추출
+      title = title.replaceAllMapped(
+        RegExp(r'<!\[CDATA\[([\s\S]*?)\]\]>', caseSensitive: false),
+        (m) => m.group(1) ?? '',
+      );
+      // 혹시 남은 고아 CDATA 태그 정리
+      title = title.replaceAll(RegExp(r'<!\[CDATA\[|\]\]>', caseSensitive: false), '');
+
+      // 2. XML 엔티티 복원
+      title = title
+          .replaceAll('&amp;', '&')
+          .replaceAll('&lt;', '<')
+          .replaceAll('&gt;', '>')
+          .replaceAll('&quot;', '"')
+          .replaceAll(RegExp(r'&apos;|&#39;'), "'")
+          // 3. 파일명 및 타이틀에 사용할 수 없는 특수문자 제거
+          .replaceAll(RegExp(r'[\\/*?:"<>|\x00-\x1f]'), '')
+          .trim();
+
+      // 4. 끝자리 마침표 제거
+      while (title.endsWith('.')) {
+        title = title.substring(0, title.length - 1).trim();
+      }
+
+      if (title.isNotEmpty) return title;
+    }
+    return null;
+  }
+
   /// OPF XML 파일에서 도서 제목(dc:title) 추출
   static Future<String?> extractTitleFromOpf(File opfFile) async {
     try {
       if (await opfFile.length() > 5 * 1024 * 1024) return null;
       final content = await opfFile.readAsString();
-      final match = RegExp(r'<dc:title(?:\s[^>]*)?>([\s\S]*?)<\/dc:title>', caseSensitive: false)
-          .firstMatch(content);
-      if (match != null && match.group(1) != null) {
-        String title = match.group(1)!;
-        title = title
-            .replaceAll('&amp;', '&')
-            .replaceAll('&lt;', '<')
-            .replaceAll('&gt;', '>')
-            .replaceAll('&quot;', '"')
-            .replaceAll(RegExp(r'&apos;|&#39;'), "'")
-            .replaceAll(RegExp(r'[\\/*?:"<>|\x00-\x1f]'), '')
-            .trim();
-        if (title.isNotEmpty) return title;
-      }
+      return parseDcTitle(content);
     } catch (_) {}
     return null;
   }
