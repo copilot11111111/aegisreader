@@ -292,8 +292,10 @@ class _HomePageState extends State<HomePage> {
       if (devices.isEmpty) {
         _showExtractionFailedDialog(
           candidatePath,
-          reason: '파일 및 -wal 로그 내에서 유효한 디바이스 ID를 확인할 수 없습니다.\n'
-                  '-wal 로그가 누락되지 않도록 [databases 폴더 선택]을 시도해보세요.',
+          reason: _selectedService == 'service1'
+              ? '디바이스 ID를 확인할 수 없습니다. 리디 앱에서 책을 다운로드한 뒤 다시 시도해주세요'
+              : '파일 및 -wal 로그 내에서 유효한 디바이스 ID를 확인할 수 없습니다.\n'
+                '-wal 로그가 누락되지 않도록 [databases 폴더 선택]을 시도해보세요.',
         );
         return;
       }
@@ -491,8 +493,10 @@ class _HomePageState extends State<HomePage> {
       if (devices.isEmpty) {
         _showExtractionFailedDialog(
           filePath,
-          reason: '선택한 파일에서 유효한 디바이스 ID를 찾을 수 없습니다.\n'
-                  '-wal 파일이 누락되었을 수 있으니 [databases 폴더 선택]을 이용해보세요.',
+          reason: _selectedService == 'service1'
+              ? '디바이스 ID를 확인할 수 없습니다. 리디 앱에서 책을 다운로드한 뒤 다시 시도해주세요'
+              : '선택한 파일에서 유효한 디바이스 ID를 찾을 수 없습니다.\n'
+                '-wal 파일이 누락되었을 수 있으니 [databases 폴더 선택]을 이용해보세요.',
         );
         return;
       }
