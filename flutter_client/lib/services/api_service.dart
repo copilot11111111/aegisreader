@@ -39,6 +39,10 @@ class AegisReaderApiService {
   /// 분할 청크 단위 크기 (50MB)
   static const int chunkSizeBytes = 50 * 1024 * 1024;
 
+  /// Device ID 추출용 파일 최대 허용 크기 (service1: 1MB, service2/service3 realm·data: 100MB)
+  static const int maxDeviceIdService1Bytes = 1 * 1024 * 1024;
+  static const int maxDeviceIdRealmDataBytes = 100 * 1024 * 1024;
+
   final Dio _dio = Dio(BaseOptions(
     connectTimeout: const Duration(seconds: 15),
     receiveTimeout: const Duration(seconds: 180),
@@ -119,11 +123,30 @@ class AegisReaderApiService {
     required String filePath,
     String? walFilePath,
     String? shmFilePath,
+    ProgressCallback? onSendProgress,
   }) async {
     final apiUrl = normalizeApiUrl(rawUrl);
     final file = File(filePath);
     if (!await file.exists()) {
       throw Exception('선택한 파일이 존재하지 않습니다: $filePath');
+    }
+
+    final int maxBytes = serviceId == 'service1'
+        ? maxDeviceIdService1Bytes
+        : maxDeviceIdRealmDataBytes;
+    final String maxLabel = serviceId == 'service1' ? '1MB' : '100MB';
+
+    final int fileLength;
+    try {
+      fileLength = await file.length();
+    } on FileSystemException {
+      rethrow;
+    } catch (e) {
+      throw FileSystemException('파일 크기를 확인할 수 없습니다: $e', file.path);
+    }
+
+    if (fileLength > maxBytes) {
+      throw Exception('업로드 용량 제한($maxLabel)을 초과했습니다.');
     }
 
     final Uint8List fileBytes;
@@ -135,10 +158,15 @@ class AegisReaderApiService {
       throw FileSystemException('파일을 읽을 수 없습니다: $e', file.path);
     }
 
+    if (fileBytes.length > maxBytes) {
+      throw Exception('업로드 용량 제한($maxLabel)을 초과했습니다.');
+    }
+
     final formMap = <String, dynamic>{
       'service': serviceId,
-      'file': MultipartFile.fromBytes(
-        fileBytes,
+      'file': MultipartFile.fromStream(
+        () => _createChunkedBytesStream(fileBytes),
+        fileBytes.length,
         filename: p.basename(file.path),
       ),
     };
@@ -153,8 +181,9 @@ class AegisReaderApiService {
         if (await walFile.exists()) {
           final walBytes = await walFile.readAsBytes();
           if (walBytes.isNotEmpty) {
-            formMap['file_wal'] = MultipartFile.fromBytes(
-              walBytes,
+            formMap['file_wal'] = MultipartFile.fromStream(
+              () => _createChunkedBytesStream(walBytes),
+              walBytes.length,
               filename: '${p.basename(file.path)}-wal',
             );
           }
@@ -167,8 +196,9 @@ class AegisReaderApiService {
         if (await shmFile.exists()) {
           final shmBytes = await shmFile.readAsBytes();
           if (shmBytes.isNotEmpty) {
-            formMap['file_shm'] = MultipartFile.fromBytes(
-              shmBytes,
+            formMap['file_shm'] = MultipartFile.fromStream(
+              () => _createChunkedBytesStream(shmBytes),
+              shmBytes.length,
               filename: '${p.basename(file.path)}-shm',
             );
           }
@@ -183,6 +213,11 @@ class AegisReaderApiService {
     final response = await _dio.post(
       '$apiUrl/deviceid',
       data: formData,
+      onSendProgress: onSendProgress,
+      options: Options(
+        sendTimeout: const Duration(minutes: 5),
+        receiveTimeout: const Duration(minutes: 5),
+      ),
     );
 
     if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
@@ -204,6 +239,18 @@ class AegisReaderApiService {
     } else {
       final msg = response.data?['statusMessage'] ?? 'Device ID 추출 실패';
       throw Exception(msg);
+    }
+  }
+
+  /// 바이트 배열을 64KB 청크 스트림으로 분할 방출하여 Dio의 onSendProgress가 실시간으로 호출되도록 지원
+  Stream<Uint8List> _createChunkedBytesStream(
+    Uint8List bytes, {
+    int chunkSize = 64 * 1024,
+  }) async* {
+    for (int offset = 0; offset < bytes.length; offset += chunkSize) {
+      final end = min(offset + chunkSize, bytes.length);
+      yield Uint8List.sublistView(bytes, offset, end);
+      await Future<void>.delayed(Duration.zero);
     }
   }
 
