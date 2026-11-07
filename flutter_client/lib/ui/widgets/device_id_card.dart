@@ -7,6 +7,9 @@ class DeviceIdCard extends StatelessWidget {
   final String serviceId;
   final DeviceStatus? deviceStatus;
   final bool isExtracting;
+  final bool showProgressBar;
+  final double uploadProgress;
+  final String? uploadStatusText;
   final VoidCallback onExtractFromFile; // 요청: 대상 서비스 경로 자동 읽기 및 API 요청
   final VoidCallback? onManualFilePick;  // 보조: 다른 파일 수동 선택
   final ValueChanged<String>? onChanged;
@@ -18,6 +21,9 @@ class DeviceIdCard extends StatelessWidget {
     required this.serviceId,
     required this.deviceStatus,
     required this.isExtracting,
+    this.showProgressBar = false,
+    this.uploadProgress = 0.0,
+    this.uploadStatusText,
     required this.onExtractFromFile,
     this.onManualFilePick,
     this.onChanged,
@@ -111,10 +117,79 @@ class DeviceIdCard extends StatelessWidget {
               ),
             ],
           ),
+          if (isExtracting && showProgressBar) ...[
+            const SizedBox(height: 8),
+            _buildUploadProgressBar(),
+          ],
           if (deviceStatus != null) ...[
             const SizedBox(height: 8),
             _buildStatusResult(context, deviceStatus!),
           ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildUploadProgressBar() {
+    final clamped = uploadProgress.clamp(0.0, 1.0);
+    final pct = (clamped * 100).round();
+    final isAnalyzing = clamped >= 1.0;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: AegisReaderTheme.surfaceBg,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: AegisReaderTheme.secondaryColor.withValues(alpha: 0.35),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(
+                isAnalyzing ? Icons.analytics_outlined : Icons.cloud_upload_rounded,
+                size: 14,
+                color: AegisReaderTheme.secondaryColor,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  (uploadStatusText != null && uploadStatusText!.isNotEmpty)
+                      ? uploadStatusText!
+                      : '파일 업로드 중... ($pct%)',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: AegisReaderTheme.textPrimary,
+                    fontWeight: FontWeight.w500,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                '$pct%',
+                style: const TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  color: AegisReaderTheme.secondaryColor,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 5),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: isAnalyzing ? null : clamped,
+              backgroundColor: AegisReaderTheme.cardBg,
+              color: AegisReaderTheme.secondaryColor,
+              minHeight: 5,
+            ),
+          ),
         ],
       ),
     );

@@ -56,6 +56,9 @@ class _HomePageState extends State<HomePage> {
 
   bool _isCheckingServer = false;
   bool _isExtractingDeviceId = false;
+  bool _showExtractProgressBar = false;
+  double _extractUploadProgress = 0.0;
+  String _extractStatusText = '';
   bool _isScanningFolder = false;
   bool _isProcessingBatch = false;
   bool _cancelRequested = false;
@@ -225,6 +228,82 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<List<ExtractedDevice>> _performDeviceIdExtraction({
+    required String filePath,
+    String? walFilePath,
+    String? shmFilePath,
+  }) async {
+    final file = File(filePath);
+    final fileLen = await file.length();
+    final isOver1Mb = fileLen > 1024 * 1024;
+    final totalMbStr = (fileLen / (1024 * 1024)).toStringAsFixed(1);
+
+    setState(() {
+      _isExtractingDeviceId = true;
+      _showExtractProgressBar = isOver1Mb;
+      _extractUploadProgress = 0.0;
+      _extractStatusText = isOver1Mb
+          ? '파일 업로드 중... 0.0 / $totalMbStr MB'
+          : '';
+    });
+
+    if (isOver1Mb) {
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    int lastReportedPct = -1;
+    String lastReportedSentMb = '';
+
+    try {
+      return await _apiService.extractDeviceIdFromFile(
+        rawUrl: _serverUrlController.text,
+        serviceId: _selectedService,
+        filePath: filePath,
+        walFilePath: walFilePath,
+        shmFilePath: shmFilePath,
+        onSendProgress: (sent, total) {
+          if (!mounted) return;
+          final effectiveTotal = total > 0 ? total : fileLen;
+          if (!isOver1Mb && effectiveTotal <= 1024 * 1024) return;
+
+          final progress = effectiveTotal > 0
+              ? (sent / effectiveTotal).clamp(0.0, 1.0)
+              : 0.0;
+          final pct = (progress * 100).round();
+          final sentMb = (sent / (1024 * 1024)).toStringAsFixed(1);
+          final totMb = (effectiveTotal / (1024 * 1024)).toStringAsFixed(1);
+
+          if (sent < effectiveTotal &&
+              pct == lastReportedPct &&
+              sentMb == lastReportedSentMb) {
+            return;
+          }
+          lastReportedPct = pct;
+          lastReportedSentMb = sentMb;
+
+          setState(() {
+            _showExtractProgressBar = true;
+            _extractUploadProgress = progress;
+            if (sent >= effectiveTotal && effectiveTotal > 0) {
+              _extractStatusText = '업로드 완료 ($totMb MB) · 서버에서 Device ID 분석 중...';
+            } else {
+              _extractStatusText = '파일 업로드 중... $sentMb / $totMb MB';
+            }
+          });
+        },
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isExtractingDeviceId = false;
+          _showExtractProgressBar = false;
+          _extractUploadProgress = 0.0;
+          _extractStatusText = '';
+        });
+      }
+    }
+  }
+
   // 5. '파일에서 추출' 버튼 핸들러 (대상 서비스 경로 자동 읽기 및 API 요청)
   Future<void> _extractDeviceIdFromFile() async {
     if (!FolderScanner.isServiceSupported(_selectedService)) {
@@ -277,17 +356,12 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
-    setState(() => _isExtractingDeviceId = true);
-
     try {
-      final devices = await _apiService.extractDeviceIdFromFile(
-        rawUrl: _serverUrlController.text,
-        serviceId: _selectedService,
+      final devices = await _performDeviceIdExtraction(
         filePath: file.path,
       );
 
       if (!mounted) return;
-      setState(() => _isExtractingDeviceId = false);
 
       if (devices.isEmpty) {
         _showExtractionFailedDialog(
@@ -312,14 +386,12 @@ class _HomePageState extends State<HomePage> {
       }
     } on FileSystemException catch (e) {
       if (!mounted) return;
-      setState(() => _isExtractingDeviceId = false);
       _showExtractionFailedDialog(
         candidatePath,
         reason: '파일 접근 권한이 제한되었습니다. 아래 버튼을 눌러 파일 또는 폴더를 선택해주세요.\n($e)',
       );
     } catch (e) {
       if (!mounted) return;
-      setState(() => _isExtractingDeviceId = false);
       String errorMsg = e.toString();
       if (e is DioException) {
         if (e.error is FileSystemException ||
@@ -331,7 +403,12 @@ class _HomePageState extends State<HomePage> {
           );
           return;
         }
-        errorMsg = e.response?.data?['statusMessage'] ?? e.message ?? e.toString();
+        final respData = e.response?.data;
+        if (respData is Map && respData['statusMessage'] != null) {
+          errorMsg = respData['statusMessage'].toString();
+        } else {
+          errorMsg = e.message ?? e.toString();
+        }
       }
       _showExtractionFailedDialog(candidatePath, reason: errorMsg);
     }
@@ -339,6 +416,12 @@ class _HomePageState extends State<HomePage> {
 
   // 추출 실패 경고 알림창
   void _showExtractionFailedDialog(String targetPath, {String? reason}) {
+    final resolvedTargetPath = targetPath.trim().isNotEmpty
+        ? targetPath.trim()
+        : FolderScanner.getDefaultDeviceIdFilePath(
+            _selectedService,
+            currentLibraryPath: _folderPathController.text.trim(),
+          );
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -374,7 +457,7 @@ class _HomePageState extends State<HomePage> {
                     border: Border.all(color: AegisReaderTheme.cardBorder),
                   ),
                   child: SelectableText(
-                    targetPath,
+                    resolvedTargetPath,
                     style: const TextStyle(fontFamily: 'monospace', fontSize: 11, color: AegisReaderTheme.textMuted),
                   ),
                 ),
@@ -421,6 +504,7 @@ class _HomePageState extends State<HomePage> {
 
   // 보조 1: 사용자가 파일(들)을 직접 선택
   Future<void> _manualPickFileForDeviceId() async {
+    String selectedTargetPath = '';
     try {
       String? initialDir;
       if (Platform.isMacOS && _selectedService == 'service3') {
@@ -471,24 +555,20 @@ class _HomePageState extends State<HomePage> {
       }
 
       final filePath = primaryPath ?? result.files.first.path!;
-
-      setState(() => _isExtractingDeviceId = true);
+      selectedTargetPath = filePath;
 
       // 알라딘(service3)의 경우 macOS 로컬 내장 sqlite3 CLI로 -wal 병합(TRUNCATE) 실행 후 API 호출
       if (_selectedService == 'service3' && Platform.isMacOS) {
         await FolderScanner.checkpointSqliteWal(filePath);
       }
 
-      final devices = await _apiService.extractDeviceIdFromFile(
-        rawUrl: _serverUrlController.text,
-        serviceId: _selectedService,
+      final devices = await _performDeviceIdExtraction(
         filePath: filePath,
         walFilePath: walPath,
         shmFilePath: shmPath,
       );
 
       if (!mounted) return;
-      setState(() => _isExtractingDeviceId = false);
 
       if (devices.isEmpty) {
         _showExtractionFailedDialog(
@@ -512,33 +592,37 @@ class _HomePageState extends State<HomePage> {
       }
     } on FileSystemException catch (e) {
       if (!mounted) return;
-      setState(() => _isExtractingDeviceId = false);
       _showExtractionFailedDialog(
-        '',
+        selectedTargetPath,
         reason: '파일 접근 권한이 제한되었습니다 ($e).\nmacOS 시스템 설정 > 개인정보 보호 및 보안 > 전체 디스크 접근 권한을 확인해주세요.',
       );
     } catch (e) {
       if (!mounted) return;
-      setState(() => _isExtractingDeviceId = false);
       String errorMsg = e.toString();
       if (e is DioException) {
         if (e.error is FileSystemException ||
             errorMsg.contains('PathAccessException') ||
             errorMsg.contains('Operation not permitted')) {
           _showExtractionFailedDialog(
-            '',
+            selectedTargetPath,
             reason: '파일 접근 권한이 제한되었습니다. 다른 위치의 파일을 선택해주세요.',
           );
           return;
         }
-        errorMsg = e.response?.data?['statusMessage'] ?? e.message ?? e.toString();
+        final respData = e.response?.data;
+        if (respData is Map && respData['statusMessage'] != null) {
+          errorMsg = respData['statusMessage'].toString();
+        } else {
+          errorMsg = e.message ?? e.toString();
+        }
       }
-      _showExtractionFailedDialog('', reason: errorMsg);
+      _showExtractionFailedDialog(selectedTargetPath, reason: errorMsg);
     }
   }
 
   // 보조 2: macOS 알라딘 databases 폴더 전체를 선택하여 -wal, -shm까지 동시 권한 획득
   Future<void> _manualPickFolderForDeviceId() async {
+    String selectedTargetPath = '';
     try {
       String? initialDir;
       if (Platform.isMacOS && _selectedService == 'service3') {
@@ -567,6 +651,7 @@ class _HomePageState extends State<HomePage> {
       );
 
       if (selectedDir == null) return;
+      selectedTargetPath = selectedDir;
 
       final sqliteFile = File(p.join(selectedDir, 'NewCrema.sqlite'));
       final dataFile = File(p.join(selectedDir, 'data'));
@@ -580,9 +665,8 @@ class _HomePageState extends State<HomePage> {
         return;
       }
 
-      setState(() => _isExtractingDeviceId = true);
-
       final filePath = targetFile.path;
+      selectedTargetPath = filePath;
       final walFile = File('$filePath-wal');
       final shmFile = File('$filePath-shm');
 
@@ -591,16 +675,13 @@ class _HomePageState extends State<HomePage> {
         await FolderScanner.checkpointSqliteWal(filePath);
       }
 
-      final devices = await _apiService.extractDeviceIdFromFile(
-        rawUrl: _serverUrlController.text,
-        serviceId: _selectedService,
+      final devices = await _performDeviceIdExtraction(
         filePath: filePath,
         walFilePath: walFile.existsSync() ? walFile.path : null,
         shmFilePath: shmFile.existsSync() ? shmFile.path : null,
       );
 
       if (!mounted) return;
-      setState(() => _isExtractingDeviceId = false);
 
       if (devices.isEmpty) {
         _showExtractionFailedDialog(
@@ -621,8 +702,16 @@ class _HomePageState extends State<HomePage> {
       }
     } catch (e) {
       if (!mounted) return;
-      setState(() => _isExtractingDeviceId = false);
-      _showExtractionFailedDialog('', reason: e.toString());
+      String errorMsg = e.toString();
+      if (e is DioException) {
+        final respData = e.response?.data;
+        if (respData is Map && respData['statusMessage'] != null) {
+          errorMsg = respData['statusMessage'].toString();
+        } else {
+          errorMsg = e.message ?? e.toString();
+        }
+      }
+      _showExtractionFailedDialog(selectedTargetPath, reason: errorMsg);
     }
   }
 
@@ -1341,6 +1430,9 @@ class _HomePageState extends State<HomePage> {
                           serviceId: _selectedService,
                           deviceStatus: _deviceStatus,
                           isExtracting: _isExtractingDeviceId,
+                          showProgressBar: _showExtractProgressBar,
+                          uploadProgress: _extractUploadProgress,
+                          uploadStatusText: _extractStatusText,
                           onExtractFromFile: _extractDeviceIdFromFile,
                           onManualFilePick: _manualPickFileForDeviceId,
                           onChanged: _onDeviceIdChanged,
