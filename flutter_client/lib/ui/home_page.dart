@@ -18,6 +18,7 @@ import 'widgets/server_header.dart';
 import 'widgets/device_id_card.dart';
 import 'widgets/folder_list_view.dart';
 import 'widgets/action_bar.dart';
+import 'widgets/quest_dialog.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -160,6 +161,17 @@ class _HomePageState extends State<HomePage> {
     if (_folderPathController.text.isNotEmpty && Directory(_folderPathController.text).existsSync()) {
       _scanFolder();
     }
+  }
+
+  // 2-1. 퀘스트 대상 도서 다이얼로그 표시
+  void _showQuestDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => QuestDialog(
+        deviceStatus: _deviceStatus,
+        onFetchQuestBooks: () => _apiService.fetchQuestBooks(_serverUrlController.text),
+      ),
+    );
   }
 
   // 3. 디바이스 ID 텍스트 수정 핸들러 (수정 시 워터마크 즉시 소멸 & 700ms 후 자동 쿼터 확인)
@@ -356,6 +368,11 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
+    final defaultGuideReason = _selectedService == 'service1'
+        ? '디바이스 ID를 확인할 수 없습니다. 리디 앱에서 책을 다운로드한 뒤 다시 시도해주세요'
+        : '파일 및 -wal 로그 내에서 유효한 디바이스 ID를 확인할 수 없습니다.\n'
+          '-wal 로그가 누락되지 않도록 [databases 폴더 선택]을 시도해보세요.';
+
     try {
       final devices = await _performDeviceIdExtraction(
         filePath: file.path,
@@ -366,10 +383,7 @@ class _HomePageState extends State<HomePage> {
       if (devices.isEmpty) {
         _showExtractionFailedDialog(
           candidatePath,
-          reason: _selectedService == 'service1'
-              ? '디바이스 ID를 확인할 수 없습니다. 리디 앱에서 책을 다운로드한 뒤 다시 시도해주세요'
-              : '파일 및 -wal 로그 내에서 유효한 디바이스 ID를 확인할 수 없습니다.\n'
-                '-wal 로그가 누락되지 않도록 [databases 폴더 선택]을 시도해보세요.',
+          reason: defaultGuideReason,
         );
         return;
       }
@@ -392,24 +406,22 @@ class _HomePageState extends State<HomePage> {
       );
     } catch (e) {
       if (!mounted) return;
-      String errorMsg = e.toString();
+      final rawErr = e.toString();
       if (e is DioException) {
         if (e.error is FileSystemException ||
-            errorMsg.contains('PathAccessException') ||
-            errorMsg.contains('Operation not permitted')) {
+            rawErr.contains('PathAccessException') ||
+            rawErr.contains('Operation not permitted')) {
           _showExtractionFailedDialog(
             candidatePath,
             reason: '파일 접근 권한이 제한되었습니다. 아래 버튼을 눌러 파일 또는 폴더를 선택해주세요.',
           );
           return;
         }
-        final respData = e.response?.data;
-        if (respData is Map && respData['statusMessage'] != null) {
-          errorMsg = respData['statusMessage'].toString();
-        } else {
-          errorMsg = e.message ?? e.toString();
-        }
       }
+      final errorMsg = AegisReaderApiService.resolveDeviceIdErrorReason(
+        e,
+        defaultGuideReason: defaultGuideReason,
+      );
       _showExtractionFailedDialog(candidatePath, reason: errorMsg);
     }
   }
@@ -505,6 +517,10 @@ class _HomePageState extends State<HomePage> {
   // 보조 1: 사용자가 파일(들)을 직접 선택
   Future<void> _manualPickFileForDeviceId() async {
     String selectedTargetPath = '';
+    final defaultGuideReason = _selectedService == 'service1'
+        ? '디바이스 ID를 확인할 수 없습니다. 리디 앱에서 책을 다운로드한 뒤 다시 시도해주세요'
+        : '선택한 파일에서 유효한 디바이스 ID를 찾을 수 없습니다.\n'
+          '-wal 파일이 누락되었을 수 있으니 [databases 폴더 선택]을 이용해보세요.';
     try {
       String? initialDir;
       if (Platform.isMacOS && _selectedService == 'service3') {
@@ -573,10 +589,7 @@ class _HomePageState extends State<HomePage> {
       if (devices.isEmpty) {
         _showExtractionFailedDialog(
           filePath,
-          reason: _selectedService == 'service1'
-              ? '디바이스 ID를 확인할 수 없습니다. 리디 앱에서 책을 다운로드한 뒤 다시 시도해주세요'
-              : '선택한 파일에서 유효한 디바이스 ID를 찾을 수 없습니다.\n'
-                '-wal 파일이 누락되었을 수 있으니 [databases 폴더 선택]을 이용해보세요.',
+          reason: defaultGuideReason,
         );
         return;
       }
@@ -598,24 +611,22 @@ class _HomePageState extends State<HomePage> {
       );
     } catch (e) {
       if (!mounted) return;
-      String errorMsg = e.toString();
+      final rawErr = e.toString();
       if (e is DioException) {
         if (e.error is FileSystemException ||
-            errorMsg.contains('PathAccessException') ||
-            errorMsg.contains('Operation not permitted')) {
+            rawErr.contains('PathAccessException') ||
+            rawErr.contains('Operation not permitted')) {
           _showExtractionFailedDialog(
             selectedTargetPath,
             reason: '파일 접근 권한이 제한되었습니다. 다른 위치의 파일을 선택해주세요.',
           );
           return;
         }
-        final respData = e.response?.data;
-        if (respData is Map && respData['statusMessage'] != null) {
-          errorMsg = respData['statusMessage'].toString();
-        } else {
-          errorMsg = e.message ?? e.toString();
-        }
       }
+      final errorMsg = AegisReaderApiService.resolveDeviceIdErrorReason(
+        e,
+        defaultGuideReason: defaultGuideReason,
+      );
       _showExtractionFailedDialog(selectedTargetPath, reason: errorMsg);
     }
   }
@@ -623,6 +634,7 @@ class _HomePageState extends State<HomePage> {
   // 보조 2: macOS 알라딘 databases 폴더 전체를 선택하여 -wal, -shm까지 동시 권한 획득
   Future<void> _manualPickFolderForDeviceId() async {
     String selectedTargetPath = '';
+    const defaultGuideReason = '선택한 폴더의 DB 및 -wal 로그에서 유효한 디바이스 ID를 찾을 수 없습니다.';
     try {
       String? initialDir;
       if (Platform.isMacOS && _selectedService == 'service3') {
@@ -686,7 +698,7 @@ class _HomePageState extends State<HomePage> {
       if (devices.isEmpty) {
         _showExtractionFailedDialog(
           filePath,
-          reason: '선택한 폴더의 DB 및 -wal 로그에서 유효한 디바이스 ID를 찾을 수 없습니다.',
+          reason: defaultGuideReason,
         );
         return;
       }
@@ -702,15 +714,10 @@ class _HomePageState extends State<HomePage> {
       }
     } catch (e) {
       if (!mounted) return;
-      String errorMsg = e.toString();
-      if (e is DioException) {
-        final respData = e.response?.data;
-        if (respData is Map && respData['statusMessage'] != null) {
-          errorMsg = respData['statusMessage'].toString();
-        } else {
-          errorMsg = e.message ?? e.toString();
-        }
-      }
+      final errorMsg = AegisReaderApiService.resolveDeviceIdErrorReason(
+        e,
+        defaultGuideReason: defaultGuideReason,
+      );
       _showExtractionFailedDialog(selectedTargetPath, reason: errorMsg);
     }
   }
@@ -1254,7 +1261,10 @@ class _HomePageState extends State<HomePage> {
         setState(() {
           book.status = BookStatus.failed;
           book.statusMessage = '실패';
-          book.errorMessage = e.toString();
+          book.errorMessage = AegisReaderApiService.extractDioErrorMessage(
+            e,
+            fallback: '복호화에 실패했습니다.',
+          );
         });
         failedCount++;
       } finally {
@@ -1447,6 +1457,7 @@ class _HomePageState extends State<HomePage> {
                           onCheckServer: _checkServerStatus,
                           onServiceChanged: _onServiceChanged,
                           onToggleWatermark: (val) => setState(() => _removeWatermark = val),
+                          onOpenQuest: _showQuestDialog,
                         ),
 
                         const SizedBox(height: 6),
