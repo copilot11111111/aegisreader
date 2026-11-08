@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:dio/dio.dart';
 import 'package:path/path.dart' as p;
 import '../models/server_status.dart';
@@ -43,11 +44,69 @@ class AegisReaderApiService {
   static const int maxDeviceIdService1Bytes = 1 * 1024 * 1024;
   static const int maxDeviceIdRealmDataBytes = 100 * 1024 * 1024;
 
-  final Dio _dio = Dio(BaseOptions(
-    connectTimeout: const Duration(seconds: 15),
-    receiveTimeout: const Duration(seconds: 180),
-    sendTimeout: const Duration(seconds: 180),
-  ));
+  static String? _cachedAppVersion;
+
+  /// pubspec.yaml에서 선언된 버전 문자열 동기/정적 탐색
+  static String _resolveInitialVersion() {
+    try {
+      for (final candidate in ['pubspec.yaml', 'flutter_client/pubspec.yaml', '../pubspec.yaml']) {
+        final f = File(candidate);
+        if (f.existsSync()) {
+          final content = f.readAsStringSync();
+          final match = RegExp(r'^version:\s*([^\s+]+)', multiLine: true).firstMatch(content);
+          if (match != null && match.group(1) != null) {
+            return match.group(1)!.trim();
+          }
+        }
+      }
+    } catch (_) {}
+    return '0.0.0';
+  }
+
+  /// pubspec.yaml에서 선언된 앱 버전 조회 (rootBundle 애셋 및 로컬 파일 탐색)
+  static Future<String> getAppVersion() async {
+    if (_cachedAppVersion != null) return _cachedAppVersion!;
+
+    // 1. rootBundle 애셋에서 pubspec.yaml 읽기 시도
+    try {
+      final yamlContent = await rootBundle.loadString('pubspec.yaml');
+      final match = RegExp(r'^version:\s*([^\s+]+)', multiLine: true).firstMatch(yamlContent);
+      if (match != null && match.group(1) != null) {
+        _cachedAppVersion = match.group(1)!.trim();
+        return _cachedAppVersion!;
+      }
+    } catch (_) {}
+
+    // 2. 동기 탐색 결과 반환 및 캐싱
+    _cachedAppVersion = _resolveInitialVersion();
+    return _cachedAppVersion!;
+  }
+
+  static final String appVersion = _resolveInitialVersion();
+
+  late final Dio _dio;
+
+  AegisReaderApiService() {
+    _dio = Dio(BaseOptions(
+      connectTimeout: const Duration(seconds: 15),
+      receiveTimeout: const Duration(seconds: 180),
+      sendTimeout: const Duration(seconds: 180),
+      headers: {
+        'User-Agent': 'AegisReader-FlutterClient/$appVersion',
+      },
+    ));
+
+    // pubspec.yaml에서 읽은 최신 버전으로 User-Agent 헤더 갱신 지원
+    _dio.interceptors.add(
+      InterceptorsWrapper(
+        onRequest: (options, handler) async {
+          final version = await getAppVersion();
+          options.headers['User-Agent'] = 'AegisReader-FlutterClient/$version';
+          handler.next(options);
+        },
+      ),
+    );
+  }
 
   /// aegisreader API 엔드포인트 URL 정규화
   /// 기본값: https://aegisreader.com/api
@@ -255,7 +314,7 @@ class AegisReaderApiService {
   }
 
   /// 4. 도서 파일 복호화 요청
-  /// POST /api/decrypt (multipart: service, deviceId, files, datFiles, removeWatermark)
+  /// POST /api/decrypt (multipart: service, deviceId, files, datFiles, metaFile, clientBookPath, bookNo, clientType, removeWatermark)
   /// 100MB 초과 도서의 경우 단일 요청 100MB 제한을 방어하기 위해 자동으로 50MB 단위 분할 업로드(Chunked Upload) 수행
   Future<List<DecryptedFileResult>> decryptBook({
     String? rawUrl,
@@ -263,6 +322,11 @@ class AegisReaderApiService {
     required String deviceId,
     required String filePath,
     String? datFilePath,
+    String? metaFilePath,
+    String? clientBookPath,
+    String? bookNo,
+    String? userNo,
+    String clientType = 'flutter_client',
     bool removeWatermark = false,
     ProgressCallback? onSendProgress,
     void Function(String message)? onStatusUpdate,
@@ -283,11 +347,25 @@ class AegisReaderApiService {
         'service': serviceId,
         'deviceId': deviceId.trim(),
         'removeWatermark': removeWatermark ? 'true' : 'false',
+        'clientType': clientType,
+        if (clientBookPath != null && clientBookPath.isNotEmpty) 'clientBookPath': clientBookPath,
+        if (bookNo != null && bookNo.isNotEmpty) 'bookNo': bookNo,
+        if (userNo != null && userNo.isNotEmpty) 'userno': userNo,
         'files': await MultipartFile.fromFile(
           bookFile.path,
           filename: p.basename(bookFile.path),
         ),
       };
+
+      if (metaFilePath != null && metaFilePath.isNotEmpty) {
+        final metaFile = File(metaFilePath);
+        if (await metaFile.exists()) {
+          formMap['metaFile'] = await MultipartFile.fromFile(
+            metaFile.path,
+            filename: p.basename(metaFile.path),
+          );
+        }
+      }
 
       if (datFilePath != null && datFilePath.isNotEmpty) {
         final datFile = File(datFilePath);
@@ -304,6 +382,14 @@ class AegisReaderApiService {
       final response = await _dio.post(
         '$apiUrl/decrypt',
         data: formData,
+        options: Options(
+          headers: {
+            'x-client-type': clientType,
+            if (clientBookPath != null && clientBookPath.isNotEmpty)
+              'x-client-book-path': Uri.encodeComponent(clientBookPath),
+            if (bookNo != null && bookNo.isNotEmpty) 'x-book-no': bookNo,
+          },
+        ),
         onSendProgress: (sent, total) {
           onSendProgress?.call(sent, total);
           if (total > 0 && sent >= total) {
@@ -336,6 +422,16 @@ class AegisReaderApiService {
     }
     final uploadId = 'up_${DateTime.now().millisecondsSinceEpoch}_${Random().nextInt(900000) + 100000}';
     final originalFileName = p.basename(bookFile.path);
+
+    Uint8List? metaBytes;
+    String? metaFileName;
+    if (metaFilePath != null && metaFilePath.isNotEmpty) {
+      final metaFile = File(metaFilePath);
+      if (await metaFile.exists()) {
+        metaBytes = await metaFile.readAsBytes();
+        metaFileName = p.basename(metaFile.path);
+      }
+    }
 
     Uint8List? datBytes;
     String? datFileName;
@@ -381,12 +477,23 @@ class AegisReaderApiService {
         'totalChunks': totalChunks.toString(),
         'originalFileName': originalFileName,
         'originalFileSize': fileLength.toString(),
+        'clientType': clientType,
+        if (clientBookPath != null && clientBookPath.isNotEmpty) 'clientBookPath': clientBookPath,
+        if (bookNo != null && bookNo.isNotEmpty) 'bookNo': bookNo,
+        if (userNo != null && userNo.isNotEmpty) 'userno': userNo,
         'files': MultipartFile.fromStream(
           () => bookFile.openRead(startOffset, endOffset),
           currentChunkSize,
           filename: '$originalFileName.part_$chunkIndex',
         ),
       };
+
+      if (metaBytes != null && metaFileName != null) {
+        formMap['metaFile'] = MultipartFile.fromBytes(
+          metaBytes,
+          filename: metaFileName,
+        );
+      }
 
       if (datBytes != null && datFileName != null) {
         formMap['datFiles'] = MultipartFile.fromBytes(
@@ -405,6 +512,12 @@ class AegisReaderApiService {
         options: Options(
           sendTimeout: const Duration(minutes: 5),
           receiveTimeout: isFinalChunk ? const Duration(minutes: 10) : const Duration(minutes: 3),
+          headers: {
+            'x-client-type': clientType,
+            if (clientBookPath != null && clientBookPath.isNotEmpty)
+              'x-client-book-path': Uri.encodeComponent(clientBookPath),
+            if (bookNo != null && bookNo.isNotEmpty) 'x-book-no': bookNo,
+          },
         ),
         cancelToken: cancelToken,
         onSendProgress: (sent, total) {

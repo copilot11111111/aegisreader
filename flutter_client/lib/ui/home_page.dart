@@ -1123,6 +1123,28 @@ class _HomePageState extends State<HomePage> {
 
         if (_cancelRequested) break;
 
+        // 메타데이터 파일 확인 및 자동 보정
+        String? metaPath = book.metaFilePath;
+        if (metaPath == null || !File(metaPath).existsSync()) {
+          if (_selectedService == 'service1') {
+            metaPath = FolderScanner.findRidiMetaFile(book.path, userNo: book.userNo, bookNo: book.bookNo);
+          } else if (_selectedService == 'service2') {
+            metaPath = FolderScanner.getDefaultDeviceIdFilePath('service2');
+          } else if (_selectedService == 'service3') {
+            metaPath = FolderScanner.getDefaultDeviceIdFilePath('service3', currentLibraryPath: _folderPathController.text.trim());
+          }
+        }
+
+        if (metaPath == null || !File(metaPath).existsSync()) {
+          setState(() {
+            book.status = BookStatus.failed;
+            book.statusMessage = '메타데이터 누락';
+            book.errorMessage = '도서 메타데이터 파일을 찾을 수 없습니다.';
+          });
+          failedCount++;
+          continue;
+        }
+
         // 단계 2: 서버로 업로드 및 복호화 요청
         setState(() {
           book.status = BookStatus.uploading;
@@ -1136,6 +1158,11 @@ class _HomePageState extends State<HomePage> {
           deviceId: deviceId,
           filePath: uploadFilePath,
           datFilePath: book.datFilePath,
+          metaFilePath: metaPath,
+          clientBookPath: book.clientBookPath ?? book.path,
+          bookNo: book.bookNo,
+          userNo: book.userNo,
+          clientType: 'flutter_client',
           removeWatermark: _removeWatermark,
           cancelToken: _currentCancelToken,
           onStatusUpdate: (msg) {

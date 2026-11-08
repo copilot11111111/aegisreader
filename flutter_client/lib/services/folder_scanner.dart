@@ -335,6 +335,63 @@ class FolderScanner {
     }
   }
 
+  /// 리디북스 도서 메타데이터 파일(BOOK_META/<BOOKNO>) 경로 탐색
+  /// 책경로/../../datastores/user/_<USERNO>/BOOK_META/<BOOKNO>
+  static String? findRidiMetaFile(String bookPath, {String? userNo, String? bookNo}) {
+    final cleanBookNo = (bookNo != null && bookNo.trim().isNotEmpty)
+        ? bookNo.trim()
+        : p.basename(bookPath).replaceAll(RegExp(r'\.(epub|zip)$', caseSensitive: false), '');
+
+    // 1. 책 경로 기준 상위 디렉터리 상대 경로 탐색
+    final parentDir = p.dirname(bookPath);
+    String? detectedUserNo = userNo;
+    if (detectedUserNo == null || detectedUserNo.isEmpty) {
+      final parentName = p.basename(parentDir);
+      if (parentName.startsWith('_')) {
+        detectedUserNo = parentName.substring(1);
+      }
+    }
+
+    if (detectedUserNo != null && detectedUserNo.isNotEmpty) {
+      final candRel = p.normalize(p.join(bookPath, '..', '..', 'datastores', 'user', '_$detectedUserNo', 'BOOK_META', cleanBookNo));
+      if (File(candRel).existsSync()) return candRel;
+    }
+
+    // 2. 표준 Ridibooks datastores 디렉터리 탐색
+    final List<String> datastoreRoots = [];
+    if (Platform.isMacOS) {
+      for (final h in getMacOSHomeCandidates()) {
+        datastoreRoots.add(p.join(h, 'Library', 'Application Support', 'Ridibooks', 'datastores', 'user'));
+      }
+    } else {
+      final appData = Platform.environment['APPDATA'] ?? '';
+      if (appData.isNotEmpty) {
+        datastoreRoots.add(p.join(appData, 'Ridibooks', 'datastores', 'user'));
+      }
+    }
+
+    for (final root in datastoreRoots) {
+      final rootDir = Directory(root);
+      if (!rootDir.existsSync()) continue;
+
+      if (detectedUserNo != null && detectedUserNo.isNotEmpty) {
+        final cand = p.join(root, '_$detectedUserNo', 'BOOK_META', cleanBookNo);
+        if (File(cand).existsSync()) return cand;
+      }
+
+      // 사용자 번호를 모르는 경우 모든 user 하위 폴더 순회
+      try {
+        final userDirs = rootDir.listSync(followLinks: false).whereType<Directory>();
+        for (final uDir in userDirs) {
+          final cand = p.join(uDir.path, 'BOOK_META', cleanBookNo);
+          if (File(cand).existsSync()) return cand;
+        }
+      } catch (_) {}
+    }
+
+    return null;
+  }
+
   /// OPF XML 문자열에서 도서 제목(dc:title) 파싱 (CDATA 언래핑 및 엔티티 복원)
   static String? parseDcTitle(String content) {
     final match = RegExp(
@@ -384,7 +441,11 @@ class FolderScanner {
   }
 
   /// 디렉터리 내의 도서 폴더 및 EPUB/ZIP 목록을 스캔
-  static Future<List<BookItem>> scanFolder(String rawPath, {String serviceId = 'service1'}) async {
+  static Future<List<BookItem>> scanFolder(
+    String rawPath, {
+    String serviceId = 'service1',
+    String? defaultMetaFilePath,
+  }) async {
     final resolvedPath = resolveEnvironmentPath(rawPath);
     final targetDir = Directory(resolvedPath);
     if (!await targetDir.exists()) {
@@ -403,6 +464,16 @@ class FolderScanner {
         );
       }
       rethrow;
+    }
+
+    // 서비스별 기본 메타데이터 파일 탐색
+    String? serviceDefaultMeta = defaultMetaFilePath;
+    if (serviceDefaultMeta == null || serviceDefaultMeta.isEmpty) {
+      if (serviceId == 'service2') {
+        serviceDefaultMeta = getDefaultDeviceIdFilePath('service2');
+      } else if (serviceId == 'service3') {
+        serviceDefaultMeta = getDefaultDeviceIdFilePath('service3', currentLibraryPath: resolvedPath);
+      }
     }
 
     for (final entry in entries) {
@@ -430,14 +501,33 @@ class FolderScanner {
           }
         }
 
+        final folderName = p.basename(entry.path);
+        final cleanBookNo = folderName.replaceAll(RegExp(r'\.(epub|zip)$', caseSensitive: false), '');
+        String? detectedUserNo;
+        final parentName = p.basename(p.dirname(entry.path));
+        if (parentName.startsWith('_')) {
+          detectedUserNo = parentName.substring(1);
+        }
+
+        String? metaPath;
+        if (serviceId == 'service1') {
+          metaPath = defaultMetaFilePath ?? findRidiMetaFile(entry.path, userNo: detectedUserNo, bookNo: cleanBookNo);
+        } else {
+          metaPath = serviceDefaultMeta;
+        }
+
         results.add(BookItem(
           id: entry.path,
-          name: p.basename(entry.path),
+          name: folderName,
           path: entry.path,
           isDirectory: true,
           fileCount: subFiles.length,
           sizeBytes: totalSize,
           datFilePath: foundDatPath,
+          metaFilePath: metaPath,
+          clientBookPath: entry.path,
+          bookNo: cleanBookNo,
+          userNo: detectedUserNo,
           detectedTitle: detectedTitle,
         ));
       } else if (entry is File) {
@@ -456,6 +546,20 @@ class FolderScanner {
             matchingDat = siblingDat.path;
           }
 
+          final cleanBookNo = stem;
+          String? detectedUserNo;
+          final parentName = p.basename(p.dirname(entry.path));
+          if (parentName.startsWith('_')) {
+            detectedUserNo = parentName.substring(1);
+          }
+
+          String? metaPath;
+          if (serviceId == 'service1') {
+            metaPath = defaultMetaFilePath ?? findRidiMetaFile(entry.path, userNo: detectedUserNo, bookNo: cleanBookNo);
+          } else {
+            metaPath = serviceDefaultMeta;
+          }
+
           results.add(BookItem(
             id: entry.path,
             name: p.basename(entry.path),
@@ -464,6 +568,10 @@ class FolderScanner {
             fileCount: 1,
             sizeBytes: size,
             datFilePath: matchingDat,
+            metaFilePath: metaPath,
+            clientBookPath: entry.path,
+            bookNo: cleanBookNo,
+            userNo: detectedUserNo,
             detectedTitle: stem,
           ));
         }
