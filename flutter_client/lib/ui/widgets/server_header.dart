@@ -13,6 +13,7 @@ class ServerHeader extends StatelessWidget {
   final VoidCallback onCheckServer;
   final ValueChanged<String> onServiceChanged;
   final ValueChanged<bool> onToggleWatermark;
+  final VoidCallback? onOpenQuest;
 
   const ServerHeader({
     super.key,
@@ -25,6 +26,7 @@ class ServerHeader extends StatelessWidget {
     required this.onCheckServer,
     required this.onServiceChanged,
     required this.onToggleWatermark,
+    this.onOpenQuest,
   });
 
   @override
@@ -183,6 +185,10 @@ class ServerHeader extends StatelessWidget {
                   ),
                   const SizedBox(width: 8),
                   _buildServiceTab('service3', '알라딘 (Aladin)', serverStatus.service3Active),
+                  if (onOpenQuest != null) ...[
+                    const SizedBox(width: 8),
+                    _buildQuestButton(),
+                  ],
                 ],
               ),
               if (selectedService == 'service1' && isPremium)
@@ -317,6 +323,53 @@ class ServerHeader extends StatelessWidget {
       onTap: () => onServiceChanged(serviceId),
       borderRadius: BorderRadius.circular(8),
       child: child,
+    );
+  }
+
+  Widget _buildQuestButton() {
+    return Tooltip(
+      message: '퀘스트 대상 도서 확인',
+      child: InkWell(
+        onTap: onOpenQuest,
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [
+                AegisReaderTheme.accentColor.withValues(alpha: 0.22),
+                AegisReaderTheme.warningColor.withValues(alpha: 0.16),
+              ],
+            ),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: isPremium
+                  ? AegisReaderTheme.warningColor.withValues(alpha: 0.6)
+                  : AegisReaderTheme.accentColor.withValues(alpha: 0.6),
+              width: 1.2,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                isPremium ? Icons.workspace_premium_rounded : Icons.emoji_events_rounded,
+                size: 14,
+                color: AegisReaderTheme.warningColor,
+              ),
+              const SizedBox(width: 5),
+              const Text(
+                '퀘스트',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

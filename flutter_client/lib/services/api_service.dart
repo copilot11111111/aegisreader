@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
@@ -7,6 +8,7 @@ import 'package:path/path.dart' as p;
 import '../models/server_status.dart';
 import '../models/device_status.dart';
 import '../models/extracted_device.dart';
+import '../models/quest_book.dart';
 
 class DecryptedFileResult {
   final String token;
@@ -43,6 +45,126 @@ class AegisReaderApiService {
   /// Device ID 추출용 파일 최대 허용 크기 (service1: 1MB, service2/service3 realm·data: 100MB)
   static const int maxDeviceIdService1Bytes = 1 * 1024 * 1024;
   static const int maxDeviceIdRealmDataBytes = 100 * 1024 * 1024;
+
+  static const Set<String> _genericHttpStatusPhrases = {
+    'bad request',
+    'unauthorized',
+    'forbidden',
+    'not found',
+    'method not allowed',
+    'payload too large',
+    'unprocessable entity',
+    'too many requests',
+    'internal server error',
+    'bad gateway',
+    'service unavailable',
+    'gateway timeout',
+    'error',
+  };
+
+  /// HTTP 상태 코드 표준 영문 문구(예: Unprocessable Entity)인지 판별
+  static bool isGenericHttpStatusPhrase(String? text) {
+    if (text == null) return true;
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return true;
+    return _genericHttpStatusPhrases.contains(trimmed.toLowerCase());
+  }
+
+  /// 서버 에러 응답(JSON Map 또는 문자열)에서 실제 사용자 안내 메시지를 추출합니다.
+  /// Nitro 프록시(createError)가 최상위 statusMessage에 'Unprocessable Entity'를 넣고
+  /// 실제 안내 문구를 data.statusMessage 또는 message에 넣는 구조를 함께 처리합니다.
+  static String? extractServerErrorMessage(dynamic responseData) {
+    if (responseData == null) return null;
+
+    if (responseData is String) {
+      final trimmed = responseData.trim();
+      if (trimmed.isEmpty || isGenericHttpStatusPhrase(trimmed)) return null;
+      if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+        try {
+          final decoded = jsonDecode(trimmed);
+          return extractServerErrorMessage(decoded);
+        } catch (_) {}
+      }
+      if (trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html')) {
+        return null;
+      }
+      return trimmed;
+    }
+
+    if (responseData is Map) {
+      final nestedData = responseData['data'];
+      if (nestedData is Map) {
+        for (final key in const ['statusMessage', 'error', 'message']) {
+          final val = nestedData[key]?.toString().trim();
+          if (val != null && val.isNotEmpty && !isGenericHttpStatusPhrase(val)) {
+            return val;
+          }
+        }
+      }
+
+      for (final key in const ['statusMessage', 'message', 'error']) {
+        final val = responseData[key]?.toString().trim();
+        if (val != null && val.isNotEmpty && !isGenericHttpStatusPhrase(val)) {
+          return val;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /// 디바이스 ID 추출 실패 시 표시할 사유 문구를 결정합니다.
+  /// HTTP 422(Unprocessable Entity) 등 추출 실패 응답인 경우 기존 가이드 문구(defaultGuideReason)를 반환합니다.
+  static String resolveDeviceIdErrorReason(
+    Object error, {
+    required String defaultGuideReason,
+  }) {
+    if (error is DioException) {
+      final statusCode = error.response?.statusCode;
+      if (statusCode == 422) {
+        return defaultGuideReason;
+      }
+
+      final serverMsg = extractServerErrorMessage(error.response?.data);
+      if (serverMsg != null && serverMsg.isNotEmpty) {
+        return serverMsg;
+      }
+
+      return defaultGuideReason;
+    }
+
+    final raw = error.toString().replaceFirst(RegExp(r'^Exception:\s*'), '').trim();
+    if (raw.isEmpty || isGenericHttpStatusPhrase(raw)) {
+      return defaultGuideReason;
+    }
+    return raw;
+  }
+
+  /// 일반 API 요청(복호화 등) 실패 시 서버 에러 메시지를 추출합니다.
+  static String extractDioErrorMessage(
+    Object error, {
+    String fallback = '요청 처리 중 오류가 발생했습니다.',
+  }) {
+    if (error is DioException) {
+      final serverMsg = extractServerErrorMessage(error.response?.data);
+      if (serverMsg != null && serverMsg.isNotEmpty) {
+        return serverMsg;
+      }
+      final dioMsg = error.message?.trim();
+      if (dioMsg != null &&
+          dioMsg.isNotEmpty &&
+          !isGenericHttpStatusPhrase(dioMsg) &&
+          !dioMsg.startsWith('This exception was thrown because')) {
+        return dioMsg;
+      }
+      return fallback;
+    }
+    final raw = error.toString().replaceFirst(RegExp(r'^Exception:\s*'), '').trim();
+    if (raw.isEmpty || isGenericHttpStatusPhrase(raw)) {
+      return fallback;
+    }
+    return raw;
+  }
 
   static String? _cachedAppVersion;
 
@@ -174,6 +296,23 @@ class AegisReaderApiService {
     return DeviceStatus.empty(serviceId, cleanDevId);
   }
 
+  /// 2-1. 퀘스트 대상 도서 목록 조회 (GET /api/quest/config)
+  Future<List<QuestBook>> fetchQuestBooks([String? rawUrl]) async {
+    final apiUrl = normalizeApiUrl(rawUrl);
+    final response = await _dio.get('$apiUrl/quest/config');
+    if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
+      final rawBooks = response.data['books'] as List<dynamic>?;
+      if (rawBooks != null) {
+        return rawBooks
+            .whereType<Map<String, dynamic>>()
+            .map((e) => QuestBook.fromJson(e))
+            .where((b) => b.name.isNotEmpty)
+            .toList();
+      }
+    }
+    return [];
+  }
+
   /// 3. 설정 파일에서 디바이스 ID 추출
   /// POST /api/deviceid (multipart: service, file, file_wal, file_shm)
   Future<List<ExtractedDevice>> extractDeviceIdFromFile({
@@ -296,7 +435,7 @@ class AegisReaderApiService {
           [];
       return ids.map((id) => ExtractedDevice(deviceId: id)).toList();
     } else {
-      final msg = response.data?['statusMessage'] ?? 'Device ID 추출 실패';
+      final msg = extractServerErrorMessage(response.data) ?? 'Device ID 추출 실패';
       throw Exception(msg);
     }
   }
@@ -401,7 +540,7 @@ class AegisReaderApiService {
 
       if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
         if (response.data['success'] != true) {
-          final msg = response.data['statusMessage'] ?? '복호화 실패';
+          final msg = extractServerErrorMessage(response.data) ?? '복호화 실패';
           throw Exception(msg);
         }
         final list = (response.data['files'] as List<dynamic>?)
@@ -410,7 +549,7 @@ class AegisReaderApiService {
             [];
         return list;
       } else {
-        final msg = response.data?['statusMessage'] ?? '복호화 실패';
+        final msg = extractServerErrorMessage(response.data) ?? '복호화 실패';
         throw Exception(msg);
       }
     }
@@ -548,16 +687,15 @@ class AegisReaderApiService {
         if (response.statusCode != 200 ||
             response.data is! Map<String, dynamic> ||
             response.data['success'] != true) {
-          final msg = (response.data is Map<String, dynamic>)
-              ? response.data['statusMessage']
-              : '청크 [${chunkIndex + 1}/$totalChunks] 전송 실패';
-          throw Exception(msg ?? '청크 전송 실패');
+          final msg = extractServerErrorMessage(response.data) ??
+              '청크 [${chunkIndex + 1}/$totalChunks] 전송 실패';
+          throw Exception(msg);
         }
       } else {
         // 최종 청크 전송 완료 및 복호화 결과 수신
         if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
           if (response.data['success'] != true) {
-            final msg = response.data['statusMessage'] ?? '복호화 실패';
+            final msg = extractServerErrorMessage(response.data) ?? '복호화 실패';
             throw Exception(msg);
           }
           final list = (response.data['files'] as List<dynamic>?)
@@ -569,10 +707,8 @@ class AegisReaderApiService {
           }
           return list;
         } else {
-          final msg = (response.data is Map<String, dynamic>)
-              ? response.data['statusMessage']
-              : '복호화 실패';
-          throw Exception(msg ?? '복호화 실패');
+          final msg = extractServerErrorMessage(response.data) ?? '복호화 실패';
+          throw Exception(msg);
         }
       }
     }
