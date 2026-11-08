@@ -16,6 +16,10 @@ class BookItem {
   final int fileCount;
   final int sizeBytes;
   final String? datFilePath;
+  final String? metaFilePath;
+  final String? clientBookPath;
+  final String? bookNo;
+  final String? userNo;
   String? detectedTitle;
   String? savedFileName;
 
@@ -34,6 +38,10 @@ class BookItem {
     required this.fileCount,
     required this.sizeBytes,
     this.datFilePath,
+    this.metaFilePath,
+    this.clientBookPath,
+    this.bookNo,
+    this.userNo,
     this.detectedTitle,
     this.savedFileName,
     this.isSelected = true,
@@ -50,6 +58,9 @@ class BookItem {
 
   /// DAT 키 파일 동봉 여부
   bool get hasDatFile => datFilePath != null && datFilePath!.isNotEmpty;
+
+  /// 메타데이터 파일 동봉 여부
+  bool get hasMetaFile => metaFilePath != null && metaFilePath!.isNotEmpty;
 
   /// 파일 크기 사람이 읽기 쉬운 포맷
   String get formattedSize {

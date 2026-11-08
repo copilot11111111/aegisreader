@@ -271,6 +271,24 @@ class FolderListView extends StatelessWidget {
                               ),
                             ),
                           ],
+                          if (item.hasMetaFile) ...[
+                            const SizedBox(width: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                              decoration: BoxDecoration(
+                                color: Colors.blue.withOpacity(0.18),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: const Text(
+                                '메타데이터 확인',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  color: Colors.lightBlueAccent,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ],
                         ],
                       ),
                       const SizedBox(height: 4),
