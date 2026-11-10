@@ -1,32 +1,15 @@
-Aladin.Ebook.Viewer.PC.Drm.*** method를 이용하면 device id만 알아도 복호화가 가능하다.
+2026년 11월 업데이트 이후 복호화 방식이 진전을 이루었다.
+우선 가장 취약하다고 생각했던 data 파일의 비밀번호를 TPM을 활용한 랜덤키 생성 방식으로 바꾸었다는 것이다.
+뿐만아니라 Device ID 자체도 평문으로 data DB에 기록하는 방식에서 벗어났다.
 
-의존 없이 복호화 하려면 몇가지 값으로 아래 단계를 밟아야 한다.
-1. xml 파일을 복호화 하기 위한 salt값(device id와 혼합해서 키를 만든다)
-2. 복호화된 rights.xml에서 암호화된 필드를 복호화 하기 위한 키와 IV 값
-3. 복호화된 필드와 device id를 기반으로 소스맵 구축
-4. 소스맵을 기반으로 hmac.new() 하기 위한 키 값 (**-**=**** 라는 의문의 값이였다)
-5. 생성된 키로 ***를 복호화하면 바이너리 값이 나온다. 이를 **에서 **로 잘라낸 hex값
-5번에서 만들어진 hex값으로 각 콘텐츠를 복호화할 수 있다.
+괄목할 점은 콘텐츠 파일 구조와 복호화 키 생성 방식도 바꿨다는 점이다.
+기존에는 META-INF, xhtml 파일 등 구조를 그대로 공개하여 복호화에 필요한 단서를 제공해버렸다는 실수를 했다.
+결정적으로 콘텐츠 복호화에 필요한 키가 이 공개된 파일에 포함되어 있다는 것이다.
+때문에 각 필드를 XX 해서 콘텐츠 복호화 키를 생성하기 쉬웠고 이를 업체에서 확인할 수 없었다.
 
-***으로 SQLite의 비밀번호를 확인할 수 있고 Device 테이블에 떡하니 device_id가 있다.
+반면 업데이트 이후에는 LicenseService를 추가해서 헤더 키와 복호화 키를 알라딘 측 서버에 요청하도록 수정하고
+받은 XX 개인키와 XX에 기록된 공개키를 기반으로 콘텐츠 복호화용 키를 생성하도록 바뀌었다.
+즉, 오프라인에 저장된 데이터만으로는 복호화가 불가능하다는 것이다.
 
-import os
-from sqlcipher3 import dbapi2 as sqlite
-
-DB_PATH = os.path.expandvars(r"%APPDATA%\AladinEbookViewer\data")
-KEY = "****" # PASSWORD
-
-conn = sqlite.connect(DB_PATH)
-cursor = conn.cursor()
-
-cursor.execute(f"PRAGMA key = '{KEY}';")
-cursor.execute("PRAGMA cipher_compatibility = 3;")
-
-cursor.execute("SELECT * FROM Device;")
-columns = [desc[0] for desc in cursor.description]
-rows = cursor.fetchall()
-
-for row in rows:
-    print(dict(zip(columns, row)))
-
-conn.close()
+그렇다고 다른 웹앱에서 알라딘으로 api 호출을 할 수는 없으니 웹앱에서 알라딘 기능을 뺄 생각이다.
+새롭게 작성한 파이썬 코드에서 잘 복호화 되는걸 보니 여전히 취약점은 존재한다고 볼 수도 있겠다.
