@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'package:path/path.dart' as p;
 import '../models/book_item.dart';
@@ -332,6 +333,72 @@ class FolderScanner {
 
       default:
         return '';
+    }
+  }
+
+  /// 예스24 Realm 암호화 키를 확인하고 DPAPI 복호화하여 Base64 문자열로 반환
+  static Future<String?> getYes24DecryptedKey([String? realmPath]) async {
+    final appData = Platform.environment['APPDATA'] ?? '';
+    final candidates = <String>[];
+    if (realmPath != null && realmPath.trim().isNotEmpty) {
+      candidates.add('$realmPath.key');
+      candidates.add(p.join(p.dirname(realmPath), 'Yes24eBook.realm.key'));
+    }
+    if (appData.isNotEmpty) {
+      candidates.add(p.join(appData, 'Yes24eBook', '.db', 'Yes24eBook.realm.key'));
+      candidates.add(p.join(appData, 'Yes24eBook', 'Yes24eBook.realm.key'));
+    }
+
+    String? keyFilePath;
+    for (final c in candidates) {
+      if (File(c).existsSync()) {
+        keyFilePath = c;
+        break;
+      }
+    }
+
+    if (keyFilePath == null) return null;
+
+    try {
+      final bytes = await File(keyFilePath).readAsBytes();
+      if (bytes.length == 64) {
+        return base64Encode(bytes);
+      }
+
+      if (Platform.isWindows) {
+        final cleanPath = keyFilePath.replaceAll("'", "''");
+        final psCommand =
+            "Add-Type -AssemblyName System.Security;"
+            "\$b=[System.IO.File]::ReadAllBytes('$cleanPath');"
+            "\$e=[System.Text.Encoding]::UTF8.GetBytes('Yes24eBook.Realm.EncryptionKey');"
+            "try{"
+            "\$k=[System.Security.Cryptography.ProtectedData]::Unprotect(\$b,\$e,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)"
+            "}catch{"
+            "\$k=[System.Security.Cryptography.ProtectedData]::Unprotect(\$b,\$e,[System.Security.Cryptography.DataProtectionScope]::LocalMachine)"
+            "};"
+            "if(\$k -and \$k.Length -eq 64){[System.Convert]::ToBase64String(\$k)}";
+
+        final procResult = await Process.run(
+          'powershell',
+          ['-NoProfile', '-NonInteractive', '-Command', psCommand],
+          runInShell: true,
+        );
+
+        if (procResult.exitCode == 0) {
+          final out = procResult.stdout.toString().trim();
+          if (out.isNotEmpty) {
+            return out;
+          }
+        }
+      }
+
+      // 64바이트 원본 키인 경우에만 Base64 반환
+      if (bytes.length == 64) {
+        return base64Encode(bytes);
+      }
+      return null;
+    } catch (_) {
+      return null;
     }
   }
 

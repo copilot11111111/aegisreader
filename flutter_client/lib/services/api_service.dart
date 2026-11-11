@@ -7,6 +7,7 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
 import 'package:path/path.dart' as p;
+import 'folder_scanner.dart';
 import '../models/server_status.dart';
 import '../models/device_status.dart';
 import '../models/extracted_device.dart';
@@ -135,16 +136,10 @@ class AegisReaderApiService {
     required String defaultGuideReason,
   }) {
     if (error is DioException) {
-      final statusCode = error.response?.statusCode;
-      if (statusCode == 422) {
-        return defaultGuideReason;
-      }
-
       final serverMsg = extractServerErrorMessage(error.response?.data);
-      if (serverMsg != null && serverMsg.isNotEmpty) {
+      if (serverMsg != null && serverMsg.isNotEmpty && !isGenericHttpStatusPhrase(serverMsg)) {
         return serverMsg;
       }
-
       return defaultGuideReason;
     }
 
@@ -410,6 +405,16 @@ class AegisReaderApiService {
       ),
     };
 
+    // 예스24(service2)의 경우 암호화된 Realm 파일을 열기 위한 64바이트 키(Base64) 탐색 및 첨부
+    if (serviceId == 'service2') {
+      try {
+        final keyStr = await FolderScanner.getYes24DecryptedKey(filePath);
+        if (keyStr != null && keyStr.isNotEmpty) {
+          formMap['file_key'] = keyStr;
+        }
+      } catch (_) {}
+    }
+
     // 알라딘(service3)의 경우 SQLite WAL(-wal, -shm) 파일이 존재하고 읽기 가능하면 함께 전송하여 커밋되지 않은 최신 Device ID 복원
     if (serviceId == 'service3') {
       final targetWalPath = walFilePath ?? '${file.path}-wal';
@@ -536,6 +541,13 @@ class AegisReaderApiService {
 
     final fileLength = await bookFile.length();
 
+    String? metaKey;
+    if (serviceId == 'service2') {
+      try {
+        metaKey = await FolderScanner.getYes24DecryptedKey(metaFilePath);
+      } catch (_) {}
+    }
+
     // 1. 단일 요청 모드 (!parallel) 이거나 파일 크기가 분할 기준 이하인 경우:
     // 청크 분할(isSplit)을 전혀 수행하지 않고, 전체 도서 파일을 단 1개의 단일 multipart POST 요청으로 통째로 전송!
     if (!parallel || fileLength <= splitThresholdBytes) {
@@ -548,6 +560,7 @@ class AegisReaderApiService {
         if (clientBookPath != null && clientBookPath.isNotEmpty) 'clientBookPath': clientBookPath,
         if (bookNo != null && bookNo.isNotEmpty) 'bookNo': bookNo,
         if (userNo != null && userNo.isNotEmpty) 'userno': userNo,
+        if (metaKey != null && metaKey.isNotEmpty) 'metaKey': metaKey,
         'files': await MultipartFile.fromFile(
           bookFile.path,
           filename: p.basename(bookFile.path),
@@ -589,6 +602,7 @@ class AegisReaderApiService {
             if (clientBookPath != null && clientBookPath.isNotEmpty)
               'x-client-book-path': Uri.encodeComponent(clientBookPath),
             if (bookNo != null && bookNo.isNotEmpty) 'x-book-no': bookNo,
+            if (metaKey != null && metaKey.isNotEmpty) 'x-meta-key': metaKey,
           },
         ),
         onSendProgress: (sent, total) {
@@ -744,6 +758,8 @@ class AegisReaderApiService {
                 'metaFile': MultipartFile.fromBytes(metaBytes, filename: metaFileName),
               if (chunkIndex == 0 && datBytes != null && datFileName != null)
                 'datFiles': MultipartFile.fromBytes(datBytes, filename: datFileName),
+              if (chunkIndex == 0 && metaKey != null && metaKey.isNotEmpty)
+                'metaKey': metaKey,
             };
 
             final currentFormData = FormData.fromMap(formMap);
@@ -759,6 +775,7 @@ class AegisReaderApiService {
                   if (clientBookPath != null && clientBookPath.isNotEmpty)
                     'x-client-book-path': Uri.encodeComponent(clientBookPath),
                   if (bookNo != null && bookNo.isNotEmpty) 'x-book-no': bookNo,
+                  if (metaKey != null && metaKey.isNotEmpty) 'x-meta-key': metaKey,
                 },
               ),
               cancelToken: cancelToken,
