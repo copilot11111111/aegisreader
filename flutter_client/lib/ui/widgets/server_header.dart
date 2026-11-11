@@ -14,6 +14,9 @@ class ServerHeader extends StatelessWidget {
   final ValueChanged<String> onServiceChanged;
   final ValueChanged<bool> onToggleWatermark;
   final VoidCallback? onOpenQuest;
+  final VoidCallback? onOpenSpeedTest;
+  final bool enableParallelTransfer;
+  final ValueChanged<bool>? onToggleParallelTransfer;
 
   const ServerHeader({
     super.key,
@@ -27,6 +30,9 @@ class ServerHeader extends StatelessWidget {
     required this.onServiceChanged,
     required this.onToggleWatermark,
     this.onOpenQuest,
+    this.onOpenSpeedTest,
+    this.enableParallelTransfer = true,
+    this.onToggleParallelTransfer,
   });
 
   @override
@@ -188,6 +194,43 @@ class ServerHeader extends StatelessWidget {
                   if (onOpenQuest != null) ...[
                     const SizedBox(width: 8),
                     _buildQuestButton(),
+                  ],
+                  if (onOpenSpeedTest != null) ...[
+                    const SizedBox(width: 8),
+                    _buildSpeedTestButton(),
+                  ],
+                  if (onToggleParallelTransfer != null) ...[
+                    const SizedBox(width: 10),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: Checkbox(
+                            value: enableParallelTransfer,
+                            activeColor: AegisReaderTheme.accentColor,
+                            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            onChanged: (val) => onToggleParallelTransfer!(val ?? true),
+                          ),
+                        ),
+                        const SizedBox(width: 5),
+                        GestureDetector(
+                          onTap: () => onToggleParallelTransfer!(!enableParallelTransfer),
+                          child: Tooltip(
+                            message: '체크 시: 파일을 청크 단위로 분할하여 다중 스트림으로 동시 업로드/다운로드합니다.\n체크 해제 시: 파일을 분할하지 않고 전체 파일을 단 1개의 단일 요청으로 업로드/다운로드합니다.',
+                            child: Text(
+                              '분할 전송',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: enableParallelTransfer ? FontWeight.bold : FontWeight.normal,
+                                color: enableParallelTransfer ? AegisReaderTheme.accentColor : AegisReaderTheme.textMuted,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ],
                 ],
               ),
@@ -360,6 +403,46 @@ class ServerHeader extends StatelessWidget {
               const SizedBox(width: 5),
               const Text(
                 '퀘스트',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSpeedTestButton() {
+    return Tooltip(
+      message: '서버 네트워크 속도 측정 (업로드/다운로드)',
+      child: InkWell(
+        onTap: onOpenSpeedTest,
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: Colors.cyan.withValues(alpha: 0.15),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: Colors.cyanAccent.withValues(alpha: 0.5),
+              width: 1.2,
+            ),
+          ),
+          child: const Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.speed_rounded,
+                size: 14,
+                color: Colors.cyanAccent,
+              ),
+              SizedBox(width: 5),
+              Text(
+                '속도 측정',
                 style: TextStyle(
                   fontSize: 12,
                   fontWeight: FontWeight.bold,

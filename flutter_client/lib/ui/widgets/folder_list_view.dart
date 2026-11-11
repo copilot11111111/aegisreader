@@ -8,6 +8,7 @@ class FolderListView extends StatelessWidget {
   final List<BookItem> books;
   final bool isScanning;
   final bool isBusy;
+  final String selectedService;
   final VoidCallback onBrowseFolder;
   final VoidCallback onScanFolder; // 필수 버튼: '폴더 목록 불러오기'
   final VoidCallback onUseDefaultPath;
@@ -22,6 +23,7 @@ class FolderListView extends StatelessWidget {
     required this.books,
     required this.isScanning,
     required this.isBusy,
+    this.selectedService = 'service1',
     required this.onBrowseFolder,
     required this.onScanFolder,
     required this.onUseDefaultPath,
@@ -284,6 +286,23 @@ class FolderListView extends StatelessWidget {
                                 style: TextStyle(
                                   fontSize: 10,
                                   color: Colors.lightBlueAccent,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ] else if (selectedService == 'service3') ...[
+                            const SizedBox(width: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                              decoration: BoxDecoration(
+                                color: Colors.amber.withOpacity(0.18),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: const Text(
+                                '메타데이터 미첨부',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  color: Colors.amberAccent,
                                   fontWeight: FontWeight.bold,
                                 ),
                               ),
