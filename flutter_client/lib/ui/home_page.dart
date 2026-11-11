@@ -19,6 +19,7 @@ import 'widgets/device_id_card.dart';
 import 'widgets/folder_list_view.dart';
 import 'widgets/action_bar.dart';
 import 'widgets/quest_dialog.dart';
+import 'widgets/speed_test_dialog.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -51,6 +52,7 @@ class _HomePageState extends State<HomePage> {
   // 상태 플래그
   String _selectedService = 'service1';
   bool _removeWatermark = false;
+  bool _enableParallelTransfer = true;
   ServerStatus _serverStatus = ServerStatus.offline();
   DeviceStatus? _deviceStatus;
   List<BookItem> _books = [];
@@ -157,6 +159,10 @@ class _HomePageState extends State<HomePage> {
       _books.clear();
     });
 
+    if (newService == 'service3') {
+      _showTopNotification('알라딘: 2026년 11월 업데이트 이전 버전에서만 사용할 수 있습니다');
+    }
+
     // 변경된 기본 폴더 자동 스캔 시도
     if (_folderPathController.text.isNotEmpty && Directory(_folderPathController.text).existsSync()) {
       _scanFolder();
@@ -170,6 +176,31 @@ class _HomePageState extends State<HomePage> {
       builder: (ctx) => QuestDialog(
         deviceStatus: _deviceStatus,
         onFetchQuestBooks: () => _apiService.fetchQuestBooks(_serverUrlController.text),
+      ),
+    );
+  }
+
+  // 2-2. 네트워크 속도 측정 다이얼로그 표시 (20MB/100MB, 단일/분할, 100Mbps 이상 자동 전환)
+  void _showSpeedTestDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => SpeedTestDialog(
+        apiService: _apiService,
+        serverUrl: _serverUrlController.text,
+        enableParallelTransfer: _enableParallelTransfer,
+        onToggleParallelTransfer: (val) {
+          setState(() => _enableParallelTransfer = val);
+        },
+        onSpeedMeasured: (result) {
+          if (result.downloadSpeedMbps >= 100.0 || result.uploadSpeedMbps >= 100.0) {
+            if (_enableParallelTransfer) {
+              setState(() => _enableParallelTransfer = false);
+              _showTopNotification(
+                '전송 속도(${result.downloadSpeedMbps.toStringAsFixed(1)} Mbps)가 100Mbps 이상으로 감지되어 단일 요청 전송 모드로 자동 전환되었습니다.',
+              );
+            }
+          }
+        },
       ),
     );
   }
@@ -1078,6 +1109,10 @@ class _HomePageState extends State<HomePage> {
       await outDir.create(recursive: true);
     }
 
+    if (_selectedService == 'service3') {
+      _showTopNotification('알라딘: 2026년 11월 업데이트 이전 버전에서만 사용할 수 있습니다');
+    }
+
     setState(() {
       _isProcessingBatch = true;
       _cancelRequested = false;
@@ -1142,7 +1177,8 @@ class _HomePageState extends State<HomePage> {
           }
         }
 
-        if (metaPath == null || !File(metaPath).existsSync()) {
+        // service3인 경우 메타데이터 제출은 선택 옵션
+        if (_selectedService != 'service3' && (metaPath == null || !File(metaPath).existsSync())) {
           setState(() {
             book.status = BookStatus.failed;
             book.statusMessage = '메타데이터 누락';
@@ -1150,6 +1186,10 @@ class _HomePageState extends State<HomePage> {
           });
           failedCount++;
           continue;
+        }
+
+        if (metaPath != null && !File(metaPath).existsSync()) {
+          metaPath = null;
         }
 
         // 단계 2: 서버로 업로드 및 복호화 요청
@@ -1171,6 +1211,7 @@ class _HomePageState extends State<HomePage> {
           userNo: book.userNo,
           clientType: 'flutter_client',
           removeWatermark: _removeWatermark,
+          parallel: _enableParallelTransfer,
           cancelToken: _currentCancelToken,
           onStatusUpdate: (msg) {
             if (mounted) {
@@ -1183,9 +1224,6 @@ class _HomePageState extends State<HomePage> {
             if (mounted && total > 0) {
               setState(() {
                 book.progress = (sent / total).clamp(0.0, 1.0);
-                if (total <= AegisReaderApiService.splitThresholdBytes) {
-                  book.statusMessage = '업로드 중 ${(sent / (1024 * 1024)).toStringAsFixed(1)}MB';
-                }
               });
             }
           },
@@ -1213,12 +1251,16 @@ class _HomePageState extends State<HomePage> {
             rawUrl: _serverUrlController.text,
             token: res.token,
             savePath: targetSavePath,
+            fileSize: res.sizeBytes,
+            parallel: _enableParallelTransfer,
             cancelToken: _currentCancelToken,
             onReceiveProgress: (rec, total) {
               if (mounted && total > 0) {
                 setState(() {
                   book.progress = rec / total;
-                  book.statusMessage = '다운로드 중 ${(rec / (1024 * 1024)).toStringAsFixed(1)}MB';
+                  book.statusMessage = _enableParallelTransfer
+                      ? '분할 다운로드 중 ${(rec / (1024 * 1024)).toStringAsFixed(1)} / ${(total / (1024 * 1024)).toStringAsFixed(1)} MB'
+                      : '단일 다운로드 중 ${(rec / (1024 * 1024)).toStringAsFixed(1)} / ${(total / (1024 * 1024)).toStringAsFixed(1)} MB';
                 });
               }
             },
@@ -1458,7 +1500,38 @@ class _HomePageState extends State<HomePage> {
                           onServiceChanged: _onServiceChanged,
                           onToggleWatermark: (val) => setState(() => _removeWatermark = val),
                           onOpenQuest: _showQuestDialog,
+                          onOpenSpeedTest: _showSpeedTestDialog,
+                          enableParallelTransfer: _enableParallelTransfer,
+                          onToggleParallelTransfer: (val) => setState(() => _enableParallelTransfer = val),
                         ),
+
+                        if (_selectedService == 'service3') ...[
+                          const SizedBox(height: 6),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                            decoration: BoxDecoration(
+                              color: Colors.amber.withOpacity(0.12),
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(color: Colors.amber.withOpacity(0.35)),
+                            ),
+                            child: const Row(
+                              children: [
+                                Icon(Icons.info_outline, color: Colors.amberAccent, size: 16),
+                                SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    '알라딘: 2026년 11월 업데이트 이전 버전만 사용할 수 있습니다.',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: Colors.amberAccent,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
 
                         const SizedBox(height: 6),
 
@@ -1486,6 +1559,7 @@ class _HomePageState extends State<HomePage> {
                             books: _books,
                             isScanning: _isScanningFolder,
                             isBusy: _isProcessingBatch,
+                            selectedService: _selectedService,
                             onBrowseFolder: _browseLibraryFolder,
                             onScanFolder: _scanFolder,
                             onUseDefaultPath: _resetDefaultLibraryPath,
