@@ -9,7 +9,7 @@ class SpeedTestDialog extends StatefulWidget {
   final String serverUrl;
   final bool enableParallelTransfer;
   final ValueChanged<bool>? onToggleParallelTransfer;
-  final void Function(SpeedTestResult result)? onSpeedMeasured;
+  final void Function(SpeedTestResult result, bool autoSwitchedToSingle)? onSpeedMeasured;
 
   const SpeedTestDialog({
     super.key,
@@ -58,6 +58,14 @@ class _SpeedTestDialogState extends State<SpeedTestDialog> {
     super.initState();
     _isParallel = widget.enableParallelTransfer;
     _targetBytes = _selectedSizeMb * 1024 * 1024;
+  }
+
+  @override
+  void didUpdateWidget(covariant SpeedTestDialog oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.enableParallelTransfer != widget.enableParallelTransfer && !_isRunning) {
+      _isParallel = widget.enableParallelTransfer;
+    }
   }
 
   @override
@@ -183,19 +191,25 @@ class _SpeedTestDialogState extends State<SpeedTestDialog> {
 
         if (autoSwitchedToSingle) {
           _statusText =
-              '속도 측정 완료: 대역폭이 100Mbps 이상이어서 [단일 전송] 모드로 자동 전환되었습니다.';
+              '속도 측정 완료: 업/다운로드 대역폭이 모두 100Mbps 이상이어서 [단일 전송] 모드로 자동 전환되었습니다.';
         } else if (result.downloadSpeedMbps >= 100.0 && result.uploadSpeedMbps < 100.0) {
           _statusText =
-              '속도 측정 완료: 업로드 대역폭(${result.uploadSpeedMbps.toStringAsFixed(1)} Mbps) 확보를 위해 [분할 전송] 모드를 권장/유지합니다.';
+              '속도 측정 완료: 업로드 대역폭(${result.uploadSpeedMbps.toStringAsFixed(1)} Mbps) 확보를 위해 [분할 전송] 모드를 ${_isParallel ? '유지' : '권장'}합니다.';
+        } else if (result.downloadSpeedMbps < 100.0 && result.uploadSpeedMbps >= 100.0) {
+          _statusText =
+              '속도 측정 완료: 다운로드 대역폭(${result.downloadSpeedMbps.toStringAsFixed(1)} Mbps) 확보를 위해 [분할 전송] 모드를 ${_isParallel ? '유지' : '권장'}합니다.';
         } else if (isHighLatencySlow) {
           _statusText =
               '속도 측정 완료: 10Mbps 미만 저속이 감지되었습니다. Cloudflare WARP 사용을 권장합니다.';
+        } else if (result.downloadSpeedMbps < 100.0 || result.uploadSpeedMbps < 100.0) {
+          _statusText =
+              '속도 측정 완료: 전송 대역폭 확보를 위해 [분할 전송] 모드를 ${_isParallel ? '유지' : '권장'}합니다.';
         } else {
           _statusText = '속도 측정이 성공적으로 완료되었습니다.';
         }
       });
 
-      widget.onSpeedMeasured?.call(result);
+      widget.onSpeedMeasured?.call(result, autoSwitchedToSingle);
     } catch (e) {
       if (!mounted) return;
       if (_cancelToken?.isCancelled == true) {
@@ -718,42 +732,52 @@ class _SpeedTestDialogState extends State<SpeedTestDialog> {
             children: [
               Icon(icon, color: accentColor, size: 20),
               const SizedBox(width: 8),
-              Text(
-                title,
-                style: const TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.bold,
-                  color: AegisReaderTheme.textPrimary,
+              Expanded(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Flexible(
+                      child: Text(
+                        title,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          color: AegisReaderTheme.textPrimary,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                      decoration: BoxDecoration(
+                        color: Colors.white12,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        modeLabel,
+                        style: const TextStyle(fontSize: 10, color: AegisReaderTheme.textMuted),
+                      ),
+                    ),
+                    if (isTimedOut) ...[
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                        decoration: BoxDecoration(
+                          color: Colors.amber.withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(color: Colors.amberAccent.withValues(alpha: 0.4)),
+                        ),
+                        child: const Text(
+                          '30초 제한 도달',
+                          style: TextStyle(fontSize: 10, color: Colors.amberAccent),
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
               ),
-              const SizedBox(width: 6),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                decoration: BoxDecoration(
-                  color: Colors.white12,
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Text(
-                  modeLabel,
-                  style: const TextStyle(fontSize: 10, color: AegisReaderTheme.textMuted),
-                ),
-              ),
-              if (isTimedOut) ...[
-                const SizedBox(width: 6),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                  decoration: BoxDecoration(
-                    color: Colors.amber.withValues(alpha: 0.15),
-                    borderRadius: BorderRadius.circular(4),
-                    border: Border.all(color: Colors.amberAccent.withValues(alpha: 0.4)),
-                  ),
-                  child: const Text(
-                    '30초 제한 도달',
-                    style: TextStyle(fontSize: 10, color: Colors.amberAccent),
-                  ),
-                ),
-              ],
-              const Spacer(),
+              const SizedBox(width: 8),
               if (isDone && durationSec != null)
                 Container(
                   margin: const EdgeInsets.only(right: 8),

@@ -1,7 +1,9 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:path/path.dart' as p;
 import '../models/book_item.dart';
+import '../models/extracted_device.dart';
 
 class FolderScanner {
   /// macOS 환경에서 /usr/bin/sqlite3를 실행하여 누적된 -wal 로그를 메인 DB로 강제 체크포인트(TRUNCATE)하여 병합
@@ -336,8 +338,19 @@ class FolderScanner {
     }
   }
 
+  static String? _cachedYes24DecryptedKey;
+
+  /// 예스24 Realm 복호화 키 캐시를 초기화합니다.
+  static void clearYes24DecryptedKeyCache() {
+    _cachedYes24DecryptedKey = null;
+  }
+
   /// 예스24 Realm 암호화 키를 확인하고 DPAPI 복호화하여 Base64 문자열로 반환
   static Future<String?> getYes24DecryptedKey([String? realmPath]) async {
+    if (_cachedYes24DecryptedKey != null && _cachedYes24DecryptedKey!.isNotEmpty) {
+      return _cachedYes24DecryptedKey;
+    }
+
     final appData = Platform.environment['APPDATA'] ?? '';
     final candidates = <String>[];
     if (realmPath != null && realmPath.trim().isNotEmpty) {
@@ -362,44 +375,517 @@ class FolderScanner {
     try {
       final bytes = await File(keyFilePath).readAsBytes();
       if (bytes.length == 64) {
-        return base64Encode(bytes);
+        final b64 = base64Encode(bytes);
+        _cachedYes24DecryptedKey = b64;
+        return b64;
       }
 
       if (Platform.isWindows) {
         final cleanPath = keyFilePath.replaceAll("'", "''");
-        final psCommand =
-            "Add-Type -AssemblyName System.Security;"
-            "\$b=[System.IO.File]::ReadAllBytes('$cleanPath');"
-            "\$e=[System.Text.Encoding]::UTF8.GetBytes('Yes24eBook.Realm.EncryptionKey');"
-            "try{"
-            "\$k=[System.Security.Cryptography.ProtectedData]::Unprotect(\$b,\$e,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)"
-            "}catch{"
-            "\$k=[System.Security.Cryptography.ProtectedData]::Unprotect(\$b,\$e,[System.Security.Cryptography.DataProtectionScope]::LocalMachine)"
-            "};"
-            "if(\$k -and \$k.Length -eq 64){[System.Convert]::ToBase64String(\$k)}";
+        final psScript = '''
+\$ProgressPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Security
+try {
+  \$b = [System.IO.File]::ReadAllBytes('$cleanPath')
+  \$e = [System.Text.Encoding]::UTF8.GetBytes('Yes24eBook.Realm.EncryptionKey')
+  \$k = \$null
+  try {
+    \$k = [System.Security.Cryptography.ProtectedData]::Unprotect(\$b, \$e, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+  } catch {
+    \$k = [System.Security.Cryptography.ProtectedData]::Unprotect(\$b, \$e, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
+  }
+  if (\$k -and \$k.Length -eq 64) {
+    Write-Output [System.Convert]::ToBase64String(\$k)
+  }
+} catch {}
+''';
 
+        final encoded = _encodePowerShellScript(psScript);
         final procResult = await Process.run(
           'powershell',
-          ['-NoProfile', '-NonInteractive', '-Command', psCommand],
+          ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
           runInShell: true,
         );
 
         if (procResult.exitCode == 0) {
           final out = procResult.stdout.toString().trim();
-          if (out.isNotEmpty) {
-            return out;
+          final match = RegExp(r'[A-Za-z0-9+/]{86}==').firstMatch(out);
+          if (match != null) {
+            _cachedYes24DecryptedKey = match.group(0);
+            return _cachedYes24DecryptedKey;
           }
         }
       }
 
       // 64바이트 원본 키인 경우에만 Base64 반환
       if (bytes.length == 64) {
-        return base64Encode(bytes);
+        final b64 = base64Encode(bytes);
+        _cachedYes24DecryptedKey = b64;
+        return b64;
       }
       return null;
     } catch (_) {
       return null;
     }
+  }
+
+  static String? _cachedAladinDecryptedKey;
+  static final Map<String, String> _cachedDecryptedAladinStrings = {};
+
+  /// 알라딘 data DB 복호화 키 및 문자열 캐시를 초기화합니다.
+  static void clearAladinDecryptedKeyCache() {
+    _cachedAladinDecryptedKey = null;
+    _cachedDecryptedAladinStrings.clear();
+  }
+
+  static String _encodePowerShellScript(String script) {
+    final units = script.codeUnits;
+    final bytes = Uint8List(units.length * 2);
+    for (int i = 0; i < units.length; i++) {
+      bytes[i * 2] = units[i] & 0xFF;
+      bytes[i * 2 + 1] = (units[i] >> 8) & 0xFF;
+    }
+    return base64Encode(bytes);
+  }
+
+  static bool _isAladinEncrypted(String s) {
+    return s.startsWith('TPM1:') ||
+        s.startsWith('DP1:') ||
+        s.startsWith('TPMU1:') ||
+        s.startsWith('DPU1:') ||
+        s.startsWith('TPM2:');
+  }
+
+  /// 알라딘 암호화 문자열 목록(TPM1:, DP1:, TPMU1:, DPU1:)을 CngKey로 일괄 복호화하여 반환
+  /// TPM MachineKey의 경우 관리자 권한(UAC Elevation)이 필요하므로 일반 권한 실패 시 RunAs로 선별 승격 실행합니다.
+  static Future<List<String>> decryptAladinStrings(List<String> rawStrings) async {
+    if (!Platform.isWindows || rawStrings.isEmpty) {
+      return rawStrings;
+    }
+
+    final Set<String> neededEncrypted = {};
+    for (final s in rawStrings) {
+      if (_isAladinEncrypted(s) && !_cachedDecryptedAladinStrings.containsKey(s)) {
+        neededEncrypted.add(s);
+      }
+    }
+
+    if (neededEncrypted.isEmpty) {
+      return rawStrings.map((s) => _cachedDecryptedAladinStrings[s] ?? s).toList();
+    }
+
+    final targetEncryptedList = neededEncrypted.toList();
+    final tempDir = Directory.systemTemp;
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final inFile = File(p.join(tempDir.path, 'aladin_batch_in_$timestamp.txt'));
+    final outFile = File(p.join(tempDir.path, 'aladin_batch_out_$timestamp.txt'));
+    final psScriptFile = File(p.join(tempDir.path, 'aladin_batch_script_$timestamp.ps1'));
+    final escapedIn = inFile.path.replaceAll("'", "''");
+    final escapedOut = outFile.path.replaceAll("'", "''");
+
+    try {
+      await inFile.writeAsString(targetEncryptedList.join('\r\n'), encoding: utf8);
+
+      final psScript = '''
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+\$ProgressPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Security
+\$script:rsa = \$null
+\$script:provider = \$null
+\$script:key = \$null
+\$script:rsaDl = \$null
+\$script:provDl = \$null
+\$script:keyDl = \$null
+
+function Decrypt-One([string]\$val) {
+  \$val = \$val.Trim()
+  if (-not \$val) { return '' }
+  if (\$val -match '^TPM1:(.+)\$') {
+    try {
+      \$prov = New-Object Security.Cryptography.CngProvider('Microsoft Platform Crypto Provider')
+      \$key = \$null
+      try {
+        \$key = [Security.Cryptography.CngKey]::Open('Aladin.Ebook.Viewer.DeviceIdKey.v1', \$prov, [Security.Cryptography.CngKeyOpenOptions]::MachineKey)
+      } catch {}
+      if (-not \$key) {
+        try {
+          \$key = [Security.Cryptography.CngKey]::Open('Aladin.Ebook.Viewer.DeviceIdKey.v1', \$prov, [Security.Cryptography.CngKeyOpenOptions]::None)
+        } catch {}
+      }
+      if (\$key) {
+        \$rsa = New-Object Security.Cryptography.RSACng(\$key)
+        \$b = [Convert]::FromBase64String(\$matches[1])
+        \$d = \$rsa.Decrypt(\$b, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+        \$s = [Text.Encoding]::UTF8.GetString(\$d)
+        if (\$s) { return \$s }
+      }
+    } catch {}
+  } elseif (\$val -match '^TPM2:(.+)\$') {
+    try {
+      \$prov = New-Object Security.Cryptography.CngProvider('Microsoft Platform Crypto Provider')
+      \$key = \$null
+      try {
+        \$key = [Security.Cryptography.CngKey]::Open('Aladin.Ebook.Viewer.DeviceIdKey.v1', \$prov, [Security.Cryptography.CngKeyOpenOptions]::MachineKey)
+      } catch {}
+      if (-not \$key) {
+        try {
+          \$key = [Security.Cryptography.CngKey]::Open('Aladin.Ebook.Viewer.DeviceIdKey.v1', \$prov, [Security.Cryptography.CngKeyOpenOptions]::None)
+        } catch {}
+      }
+      if (\$key) {
+        \$rsa = New-Object Security.Cryptography.RSACng(\$key)
+        \$raw = [Convert]::FromBase64String(\$matches[1])
+        \$num = ([int]\$raw[0] -shl 8) -bor [int]\$raw[1]
+        \$num2 = \$raw.Length - 2 - \$num - 16 - 32
+        \$rsaEnc = New-Object byte[] \$num
+        [Buffer]::BlockCopy(\$raw, 2, \$rsaEnc, 0, \$num)
+        \$num3 = 2 + \$num
+        \$num4 = \$num3 + 16
+        \$decKey = \$rsa.Decrypt(\$rsaEnc, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+        \$aesKey = New-Object byte[] 32
+        [Buffer]::BlockCopy(\$decKey, 0, \$aesKey, 0, 32)
+        \$aesIv = New-Object byte[] 16
+        [Buffer]::BlockCopy(\$raw, \$num3, \$aesIv, 0, 16)
+        \$aes = [Security.Cryptography.Aes]::Create()
+        \$aes.Key = \$aesKey
+        \$aes.IV = \$aesIv
+        \$aes.Mode = [Security.Cryptography.CipherMode]::CBC
+        \$aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+        \$dec = \$aes.CreateDecryptor()
+        \$plainBytes = \$dec.TransformFinalBlock(\$raw, \$num4, \$num2)
+        \$base64Token = [Text.Encoding]::UTF8.GetString(\$plainBytes).Trim()
+        if (\$base64Token) {
+          try {
+            Add-Type -AssemblyName System.Management
+            function Q-AladinWmi([string]\$p, [string]\$c) {
+              try {
+                \$mc = New-Object System.Management.ManagementClass(\$c)
+                foreach (\$mo in \$mc.GetInstances()) {
+                  \$v = \$mo[\$p]
+                  if (\$v) { return \$v.ToString() }
+                }
+              } catch {}
+              return ''
+            }
+            \$cpu = Q-AladinWmi 'UniqueId' 'Win32_Processor'
+            if (-not \$cpu) { \$cpu = Q-AladinWmi 'ProcessorId' 'Win32_Processor' }
+            if (-not \$cpu) { \$cpu = Q-AladinWmi 'Name' 'Win32_Processor' }
+            if (-not \$cpu) { \$cpu = (Q-AladinWmi 'Manufacturer' 'Win32_Processor') + (Q-AladinWmi 'MaxClockSpeed' 'Win32_Processor') }
+
+            \$bios = (Q-AladinWmi 'Manufacturer' 'Win32_BIOS') + (Q-AladinWmi 'IdentificationCode' 'Win32_BIOS') + (Q-AladinWmi 'SerialNumber' 'Win32_BIOS')
+            \$base = (Q-AladinWmi 'Model' 'Win32_BaseBoard') + (Q-AladinWmi 'Manufacturer' 'Win32_BaseBoard') + (Q-AladinWmi 'Name' 'Win32_BaseBoard') + (Q-AladinWmi 'SerialNumber' 'Win32_BaseBoard')
+
+            \$hwRaw = 'CPU >> ' + \$cpu + "`nBIOS >> " + \$bios + "`nBASE >> " + \$base
+            \$md5 = [System.Security.Cryptography.MD5]::Create()
+            \$hashBytes = \$md5.ComputeHash([System.Text.Encoding]::ASCII.GetBytes(\$hwRaw))
+            \$hex = [BitConverter]::ToString(\$hashBytes).Replace('-', '').ToUpper()
+            \$hwHash = \$hex.Substring(0, 4) + '-' + \$hex.Substring(4, 4) + '-' + \$hex.Substring(8, 4) + '-' + \$hex.Substring(12, 4) + '-' + \$hex.Substring(16, 4) + '-' + \$hex.Substring(20, 4) + '-' + \$hex.Substring(24, 4) + '-' + \$hex.Substring(28, 4)
+
+            \$hwKey = [System.Text.Encoding]::UTF8.GetBytes(\$hwHash.Substring(0, 16))
+            \$hwIv  = [System.Text.Encoding]::UTF8.GetBytes(\$hwHash.Substring(8, 16))
+
+            \$cBytes = [Convert]::FromBase64String(\$base64Token)
+            \$rij = [System.Security.Cryptography.RijndaelManaged]::new()
+            \$rij.Mode = [System.Security.Cryptography.CipherMode]::CBC
+            \$rij.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+            \$rij.KeySize = 128
+            \$rij.BlockSize = 128
+            \$rij.Key = \$hwKey
+            \$rij.IV = \$hwIv
+
+            \$dec2 = \$rij.CreateDecryptor()
+            \$ms = [System.IO.MemoryStream]::new(\$cBytes)
+            \$cs = [System.Security.Cryptography.CryptoStream]::new(\$ms, \$dec2, [System.Security.Cryptography.CryptoStreamMode]::Read)
+            \$sr = [System.IO.StreamReader]::new(\$cs, [System.Text.Encoding]::UTF8)
+            \$finalJwt = \$sr.ReadToEnd().Trim()
+            \$sr.Close()
+            \$cs.Close()
+            \$ms.Close()
+            \$rij.Clear()
+            if (\$finalJwt) { return \$finalJwt }
+          } catch {}
+          return \$base64Token
+        }
+      }
+    } catch {}
+  } elseif (\$val -match '^DP1:(.+)\$') {
+    try {
+      \$b = [Convert]::FromBase64String(\$matches[1])
+      \$ent = [Text.Encoding]::UTF8.GetBytes('Aladin.Ebook.Viewer.Entropy.v1')
+      try { \$d = [Security.Cryptography.ProtectedData]::Unprotect(\$b, \$ent, [Security.Cryptography.DataProtectionScope]::CurrentUser) }
+      catch { \$d = [Security.Cryptography.ProtectedData]::Unprotect(\$b, \$ent, [Security.Cryptography.DataProtectionScope]::LocalMachine) }
+      \$s = [Text.Encoding]::UTF8.GetString(\$d)
+      if (\$s) { return \$s }
+    } catch {}
+  } elseif (\$val -match '^TPMU1:(.+)\$') {
+    try {
+      \$provDl = New-Object Security.Cryptography.CngProvider('Microsoft Platform Crypto Provider')
+      \$keyDl = \$null
+      try {
+        \$keyDl = [Security.Cryptography.CngKey]::Open('Aladin.Ebook.Viewer.DownloadKey.v1', \$provDl, [Security.Cryptography.CngKeyOpenOptions]::None)
+      } catch {}
+      if (-not \$keyDl) {
+        try {
+          \$keyDl = [Security.Cryptography.CngKey]::Open('Aladin.Ebook.Viewer.DownloadKey.v1', \$provDl, [Security.Cryptography.CngKeyOpenOptions]::MachineKey)
+        } catch {}
+      }
+      if (\$keyDl) {
+        \$rsaDl = New-Object Security.Cryptography.RSACng(\$keyDl)
+        \$b = [Convert]::FromBase64String(\$matches[1])
+        \$d = \$rsaDl.Decrypt(\$b, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+        \$hex = [BitConverter]::ToString(\$d).Replace('-', '').ToLower()
+        if (\$hex) { return \$hex }
+      }
+    } catch {}
+  } elseif (\$val -match '^DPU1:(.+)\$') {
+    try {
+      \$b = [Convert]::FromBase64String(\$matches[1])
+      \$ent = [Text.Encoding]::UTF8.GetBytes('Aladin.Ebook.Viewer.DownloadKey.v1')
+      try { \$d = [Security.Cryptography.ProtectedData]::Unprotect(\$b, \$ent, [Security.Cryptography.DataProtectionScope]::CurrentUser) }
+      catch { \$d = [Security.Cryptography.ProtectedData]::Unprotect(\$b, \$ent, [Security.Cryptography.DataProtectionScope]::LocalMachine) }
+      \$hex = [BitConverter]::ToString(\$d).Replace('-', '').ToLower()
+      if (\$hex) { return \$hex }
+    } catch {}
+  }
+  return \$val
+}
+
+\$lines = @()
+if (Test-Path '$escapedIn') {
+  \$lines = [System.IO.File]::ReadAllLines('$escapedIn', [System.Text.Encoding]::UTF8)
+}
+
+\$results = [System.Collections.Generic.List[string]]::new()
+foreach (\$line in \$lines) {
+  \$dec = Decrypt-One \$line
+  \$results.Add(\$dec)
+}
+
+[System.IO.File]::WriteAllLines('$escapedOut', \$results, [System.Text.Encoding]::UTF8)
+''';
+
+      await psScriptFile.writeAsString(psScript, encoding: utf8);
+
+      // 1. 일반 권한 (또는 이미 관리자로 실행 중인 경우)으로 1차 실행 시도
+      await Process.run(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', psScriptFile.path],
+        runInShell: true,
+      );
+
+      List<String> decrypted = [];
+      if (await outFile.exists()) {
+        decrypted = await outFile.readAsLines(encoding: utf8);
+      }
+
+      final anyStillEncrypted = decrypted.isEmpty ||
+          decrypted.any((s) => _isAladinEncrypted(s));
+
+      // 2. 권한 부족(MachineKey 액세스 거부)으로 복호화 실패 시, 관리자 권한(UAC RunAs)으로 승격 실행
+      if (anyStillEncrypted) {
+        if (await outFile.exists()) {
+          await outFile.delete();
+        }
+
+        final escapedPsPath = psScriptFile.path.replaceAll("'", "''");
+        final elevateCommand =
+            "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden "
+            "-ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"\"$escapedPsPath\"\"'";
+
+        await Process.run(
+          'powershell',
+          ['-NoProfile', '-Command', elevateCommand],
+          runInShell: true,
+        );
+
+        if (await outFile.exists()) {
+          final elevatedDecrypted = await outFile.readAsLines(encoding: utf8);
+          if (elevatedDecrypted.isNotEmpty &&
+              elevatedDecrypted.length == targetEncryptedList.length &&
+              !elevatedDecrypted.any((s) => _isAladinEncrypted(s))) {
+            decrypted = elevatedDecrypted;
+          }
+        }
+      }
+
+      if (decrypted.isNotEmpty && decrypted.length == targetEncryptedList.length) {
+        for (int i = 0; i < targetEncryptedList.length; i++) {
+          final decVal = decrypted[i];
+          if (!_isAladinEncrypted(decVal)) {
+            _cachedDecryptedAladinStrings[targetEncryptedList[i]] = decVal;
+          }
+        }
+      }
+    } catch (_) {
+    } finally {
+      try {
+        if (await inFile.exists()) await inFile.delete();
+        if (await outFile.exists()) await outFile.delete();
+        if (await psScriptFile.exists()) await psScriptFile.delete();
+      } catch (_) {}
+    }
+
+    return rawStrings.map((s) => _cachedDecryptedAladinStrings[s] ?? s).toList();
+  }
+
+  /// 알라딘 data DB 암호화 키를 확인하고 TPM/DPAPI 복호화하여 16바이트 문자열(또는 기본 키) 반환
+  /// TPM MachineKey의 경우 관리자 권한(UAC Elevation)이 필요하므로 일반 권한 실패 시 RunAs로 선별 승격 실행합니다.
+  /// ExecutionPolicy 제약(Restricted)을 우회하기 위해 .ps1 파일 대신 -EncodedCommand로 인라인 실행합니다.
+  static Future<String?> getAladinDecryptedKey([String? dataPath]) async {
+    const defaultKey = '00000000000000000000000000000000';
+    if (!Platform.isWindows) {
+      return defaultKey;
+    }
+
+    if (_cachedAladinDecryptedKey != null && _cachedAladinDecryptedKey!.isNotEmpty) {
+      return _cachedAladinDecryptedKey;
+    }
+
+    try {
+      // 1. 현재 사용자 레지스트리에서 DbKeyEnc 값을 사전 조회
+      final regProc = await Process.run(
+        'powershell',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          "(Get-ItemProperty -Path 'HKCU:Software/AladinEbookViewer' -ErrorAction SilentlyContinue).DbKeyEnc",
+        ],
+        runInShell: true,
+      );
+      final rawKey = regProc.stdout.toString().trim();
+      if (rawKey.isNotEmpty) {
+        if (!rawKey.startsWith('TPM1:') && !rawKey.startsWith('DP1:')) {
+          _cachedAladinDecryptedKey = rawKey;
+          return rawKey;
+        }
+        final decryptedList = await decryptAladinStrings([rawKey]);
+        if (decryptedList.isNotEmpty && !decryptedList.first.startsWith('TPM1:') && !decryptedList.first.startsWith('DP1:')) {
+          _cachedAladinDecryptedKey = decryptedList.first;
+          return decryptedList.first;
+        }
+        return rawKey;
+      }
+    } catch (_) {}
+
+    return defaultKey;
+  }
+
+  static final List<Map<String, dynamic>> _cachedAladinPurchaseList = [];
+  static List<Map<String, dynamic>> get cachedAladinPurchaseList => List.unmodifiable(_cachedAladinPurchaseList);
+  static Map<String, dynamic>? _cachedAladinUser;
+  static Map<String, dynamic>? get cachedAladinUser => _cachedAladinUser != null ? Map.unmodifiable(_cachedAladinUser!) : null;
+
+  /// '디바이스 ID 추출' 시 data DB에서 읽어온 사용자 정보(User) 캐싱
+  static void cacheAladinUser(dynamic user) {
+    if (user is Map<String, dynamic>) {
+      _cachedAladinUser = Map<String, dynamic>.from(user);
+    } else if (user is Map) {
+      _cachedAladinUser = Map<String, dynamic>.from(user);
+    }
+  }
+
+  /// '디바이스 ID 추출' 시 data DB에서 읽어온 알라딘 도서 메타데이터(PurchaseList) 캐싱
+  static void cacheAladinPurchaseList(List<dynamic> list) {
+    _cachedAladinPurchaseList.clear();
+    for (final item in list) {
+      if (item is Map<String, dynamic>) {
+        _cachedAladinPurchaseList.add(item);
+      } else if (item is Map) {
+        _cachedAladinPurchaseList.add(Map<String, dynamic>.from(item));
+      }
+    }
+  }
+
+  /// 스캔된 도서 목록에 캐시된 알라딘 메타데이터(downloadKeyEnc, downloadKeyId, title 등)를 미리 매칭
+  static void matchBooksWithAladinPurchaseList(List<BookItem> books) {
+    if (_cachedAladinPurchaseList.isEmpty) return;
+    for (final book in books) {
+      final cleanBookNo = book.bookNo?.trim() ?? '';
+      final fileName = p.basename(book.path).replaceAll(RegExp(r'\.(epub_comic|epub|zip|cpub)$', caseSensitive: false), '').trim();
+      final bookPathNorm = book.path.replaceAll('\\', '/').toLowerCase();
+
+      for (final pItem in _cachedAladinPurchaseList) {
+        final itemId = pItem['itemId']?.toString().trim() ?? '';
+        final title = pItem['title']?.toString().trim() ?? '';
+        final filePath = pItem['filePath']?.toString().trim() ?? '';
+        final filePathNorm = filePath.replaceAll('\\', '/').toLowerCase();
+
+        bool matched = false;
+        if (cleanBookNo.isNotEmpty && itemId.isNotEmpty && cleanBookNo == itemId) {
+          matched = true;
+        } else if (fileName.isNotEmpty && itemId.isNotEmpty && fileName == itemId) {
+          matched = true;
+        } else if (filePathNorm.isNotEmpty && (bookPathNorm.endsWith(filePathNorm) || filePathNorm.endsWith(bookPathNorm))) {
+          matched = true;
+        }
+
+        if (matched) {
+          book.downloadKeyId = pItem['downloadKeyId']?.toString();
+          book.downloadKeyEnc = pItem['downloadKeyEnc']?.toString();
+          final drmTypeNum = pItem['drmType'];
+          if (drmTypeNum is num) {
+            book.drmType = drmTypeNum.toInt();
+          }
+          if (title.isNotEmpty && (book.detectedTitle == null || book.detectedTitle == book.name)) {
+            book.detectedTitle = title;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  /// 알라딘 도서 복호화 키(privKey) 추출
+  /// 관리자 권한을 요청한 CNG 스크립트로 downloadKeyEnc를 복호화하여 privKey(32B hex)를 도출
+  static Future<AladinV4Keys?> extractAladinV4Keys({
+    required String itemId,
+    String? downloadKeyEnc,
+    String? downloadKeyId,
+    String? dataDbPath,
+    String? metaKey,
+    String? contentKey,
+    ExtractedDevice? device,
+  }) async {
+    if (!Platform.isWindows || itemId.isEmpty) return null;
+
+    String? privKey;
+    String? effectiveDownloadKeyId = downloadKeyId;
+    String? enc = downloadKeyEnc;
+
+    // 1. downloadKeyEnc가 전달되지 않은 경우 캐시된 purchaseList에서 탐색
+    if (enc == null || enc.isEmpty) {
+      final cachedItem = _cachedAladinPurchaseList.firstWhere(
+        (b) => b['itemId']?.toString() == itemId,
+        orElse: () => <String, dynamic>{},
+      );
+      enc = cachedItem['downloadKeyEnc']?.toString();
+      effectiveDownloadKeyId ??= cachedItem['downloadKeyId']?.toString();
+    }
+
+    // 2. downloadKeyEnc를 순수 CNG 복호화(UAC RunAs 선별)로 32바이트 privKey 도출
+    if (enc != null && enc.isNotEmpty) {
+      try {
+        final decrypted = await decryptAladinStrings([enc]);
+        if (decrypted.isNotEmpty && !_isAladinEncrypted(decrypted.first)) {
+          privKey = decrypted.first;
+          // ignore: avoid_print
+        } else if (decrypted.isNotEmpty) {
+          // ignore: avoid_print
+        }
+      } catch (e) {
+        // ignore: avoid_print
+      }
+    } else {
+      // ignore: avoid_print
+    }
+
+    return AladinV4Keys(
+      privKey: privKey,
+      contentKey: contentKey,
+      downloadKeyId: effectiveDownloadKeyId,
+      metaKey: metaKey,
+    );
   }
 
   /// 리디북스 도서 메타데이터 파일(BOOK_META/<BOOKNO>) 경로 탐색
@@ -569,7 +1055,7 @@ class FolderScanner {
         }
 
         final folderName = p.basename(entry.path);
-        final cleanBookNo = folderName.replaceAll(RegExp(r'\.(epub|zip)$', caseSensitive: false), '');
+        final cleanBookNo = folderName.replaceAll(RegExp(r'\.(epub_comic|epub|zip|cpub)$', caseSensitive: false), '');
         String? detectedUserNo;
         final parentName = p.basename(p.dirname(entry.path));
         if (parentName.startsWith('_')) {
@@ -599,21 +1085,21 @@ class FolderScanner {
         ));
       } else if (entry is File) {
         final lower = entry.path.toLowerCase();
-        final isEpub = lower.endsWith('.epub');
+        final isEpub = lower.endsWith('.epub') || lower.endsWith('.epub_comic') || lower.endsWith('.cpub');
         final isZip = lower.endsWith('.zip');
 
         if (isEpub || isZip) {
           final size = await entry.length();
-          final stem = p.basenameWithoutExtension(entry.path);
+          final fileName = p.basename(entry.path);
+          final cleanBookNo = fileName.replaceAll(RegExp(r'\.(epub_comic|epub|zip|cpub)$', caseSensitive: false), '');
 
           // 같은 폴더 내에 동일 이름의 .dat 파일이 있는지 검사
           String? matchingDat;
-          final siblingDat = File(p.join(p.dirname(entry.path), '$stem.dat'));
+          final siblingDat = File(p.join(p.dirname(entry.path), '$cleanBookNo.dat'));
           if (await siblingDat.exists()) {
             matchingDat = siblingDat.path;
           }
 
-          final cleanBookNo = stem;
           String? detectedUserNo;
           final parentName = p.basename(p.dirname(entry.path));
           if (parentName.startsWith('_')) {
@@ -629,7 +1115,7 @@ class FolderScanner {
 
           results.add(BookItem(
             id: entry.path,
-            name: p.basename(entry.path),
+            name: fileName,
             path: entry.path,
             isDirectory: false,
             fileCount: 1,
@@ -639,14 +1125,34 @@ class FolderScanner {
             clientBookPath: entry.path,
             bookNo: cleanBookNo,
             userNo: detectedUserNo,
-            detectedTitle: stem,
+            detectedTitle: cleanBookNo,
           ));
         }
       }
+    }
+
+    // 알라딘의 경우 캐시된 purchaseList 메타데이터(downloadKey 등)를 미리 매칭
+    if (serviceId == 'service3') {
+      matchBooksWithAladinPurchaseList(results);
     }
 
     // 이름순 정렬
     results.sort((a, b) => a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()));
     return results;
   }
+}
+
+/// service3 2026.11
+class AladinV4Keys {
+  final String? privKey;
+  final String? contentKey;
+  final String? downloadKeyId;
+  final String? metaKey;
+
+  AladinV4Keys({
+    this.privKey,
+    this.contentKey,
+    this.downloadKeyId,
+    this.metaKey,
+  });
 }

@@ -51,6 +51,7 @@ class _HomePageState extends State<HomePage> {
 
   // 상태 플래그
   String _selectedService = 'service1';
+  ExtractedDevice? _selectedDevice;
   bool _removeWatermark = false;
   bool _enableParallelTransfer = true;
   ServerStatus _serverStatus = ServerStatus.offline();
@@ -159,10 +160,6 @@ class _HomePageState extends State<HomePage> {
       _books.clear();
     });
 
-    if (newService == 'service3') {
-      _showTopNotification('알라딘: 2026년 11월 업데이트 이전 버전에서만 사용할 수 있습니다');
-    }
-
     // 변경된 기본 폴더 자동 스캔 시도
     if (_folderPathController.text.isNotEmpty && Directory(_folderPathController.text).existsSync()) {
       _scanFolder();
@@ -180,7 +177,7 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // 2-2. 네트워크 속도 측정 다이얼로그 표시 (20MB/100MB, 단일/분할, 100Mbps 이상 자동 전환)
+  // 2-2. 네트워크 속도 측정 다이얼로그 표시 (20MB/90MB, 단일/분할, 업/다운 모두 100Mbps 이상 시 단일 전송 모드로 자동 전환)
   void _showSpeedTestDialog() {
     showDialog(
       context: context,
@@ -191,14 +188,11 @@ class _HomePageState extends State<HomePage> {
         onToggleParallelTransfer: (val) {
           setState(() => _enableParallelTransfer = val);
         },
-        onSpeedMeasured: (result) {
-          if (result.downloadSpeedMbps >= 100.0 || result.uploadSpeedMbps >= 100.0) {
-            if (_enableParallelTransfer) {
-              setState(() => _enableParallelTransfer = false);
-              _showTopNotification(
-                '전송 속도(${result.downloadSpeedMbps.toStringAsFixed(1)} Mbps)가 100Mbps 이상으로 감지되어 단일 요청 전송 모드로 자동 전환되었습니다.',
-              );
-            }
+        onSpeedMeasured: (result, autoSwitchedToSingle) {
+          if (autoSwitchedToSingle) {
+            _showTopNotification(
+              '전송 속도(다운: ${result.downloadSpeedMbps.toStringAsFixed(1)} Mbps, 업: ${result.uploadSpeedMbps.toStringAsFixed(1)} Mbps)가 모두 100Mbps 이상으로 감지되어 단일 요청 전송 모드로 자동 전환되었습니다.',
+            );
           }
         },
       ),
@@ -220,6 +214,20 @@ class _HomePageState extends State<HomePage> {
     }
 
     if (trimmed.isNotEmpty) {
+      if (_selectedService == 'service3' && (trimmed.startsWith('TPM1:') || trimmed.startsWith('DP1:'))) {
+        FolderScanner.decryptAladinStrings([trimmed]).then((decrypted) {
+          if (mounted && decrypted.isNotEmpty && !decrypted.first.startsWith('TPM1:') && !decrypted.first.startsWith('DP1:')) {
+            final cleanId = decrypted.first;
+            setState(() {
+              _deviceIdController.text = cleanId;
+              _serviceDeviceIds['service3'] = cleanId;
+            });
+            _checkDeviceId(silent: true);
+          }
+        });
+        return;
+      }
+
       _deviceIdDebounceTimer = Timer(const Duration(milliseconds: 700), () {
         if (mounted && _deviceIdController.text.trim() == trimmed) {
           _checkDeviceId(silent: true);
@@ -230,7 +238,7 @@ class _HomePageState extends State<HomePage> {
 
   // 4. 디바이스 ID 유효성 및 쿼터 확인
   Future<void> _checkDeviceId({bool silent = false}) async {
-    final devId = _deviceIdController.text.trim();
+    var devId = _deviceIdController.text.trim();
     if (devId.isEmpty) {
       setState(() {
         _deviceStatus = null;
@@ -238,6 +246,21 @@ class _HomePageState extends State<HomePage> {
         _removeWatermark = false;
       });
       return;
+    }
+
+    if (_selectedService == 'service3' && (devId.startsWith('TPM1:') || devId.startsWith('DP1:'))) {
+      try {
+        final decrypted = await FolderScanner.decryptAladinStrings([devId]);
+        if (decrypted.isNotEmpty && !decrypted.first.startsWith('TPM1:') && !decrypted.first.startsWith('DP1:')) {
+          devId = decrypted.first;
+          if (mounted) {
+            setState(() {
+              _deviceIdController.text = devId;
+              _serviceDeviceIds['service3'] = devId;
+            });
+          }
+        }
+      } catch (_) {}
     }
 
     try {
@@ -401,8 +424,11 @@ class _HomePageState extends State<HomePage> {
 
     final defaultGuideReason = _selectedService == 'service1'
         ? '디바이스 ID를 확인할 수 없습니다. 리디 앱에서 책을 다운로드한 뒤 다시 시도해주세요'
-        : '파일 및 -wal 로그 내에서 유효한 디바이스 ID를 확인할 수 없습니다.\n'
-          '-wal 로그가 누락되지 않도록 [databases 폴더 선택]을 시도해보세요.';
+        : _selectedService == 'service2'
+            ? 'Yes24 Realm 파일에서 유효한 디바이스 ID를 확인할 수 없습니다.\n'
+              'Yes24 앱에 로그인한 상태인지 확인하거나 [파일 직접 선택]을 시도해보세요.'
+            : '파일 및 -wal 로그 내에서 유효한 디바이스 ID를 확인할 수 없습니다.\n'
+              '-wal 로그가 누락되지 않도록 [databases 폴더 선택]을 시도해보세요.';
 
     try {
       final devices = await _performDeviceIdExtraction(
@@ -419,8 +445,16 @@ class _HomePageState extends State<HomePage> {
         return;
       }
 
+      if (_selectedService == 'service3' && _books.isNotEmpty) {
+        setState(() {
+          FolderScanner.matchBooksWithAladinPurchaseList(_books);
+        });
+      }
+
       if (devices.length == 1) {
-        final extractedId = devices.first.deviceId;
+        final extracted = devices.first;
+        _selectedDevice = extracted;
+        final extractedId = extracted.deviceId;
         _deviceIdController.text = extractedId;
         _serviceDeviceIds[_selectedService] = extractedId;
         _showTopNotification('디바이스 ID 자동 추출 성공: $extractedId');
@@ -550,8 +584,11 @@ class _HomePageState extends State<HomePage> {
     String selectedTargetPath = '';
     final defaultGuideReason = _selectedService == 'service1'
         ? '디바이스 ID를 확인할 수 없습니다. 리디 앱에서 책을 다운로드한 뒤 다시 시도해주세요'
-        : '선택한 파일에서 유효한 디바이스 ID를 찾을 수 없습니다.\n'
-          '-wal 파일이 누락되었을 수 있으니 [databases 폴더 선택]을 이용해보세요.';
+        : _selectedService == 'service2'
+            ? '선택한 Realm 파일에서 유효한 디바이스 ID를 찾을 수 없습니다.\n'
+              'Yes24 앱에 로그인한 상태인지 확인하거나 올바른 파일을 선택해주세요.'
+            : '선택한 파일에서 유효한 디바이스 ID를 찾을 수 없습니다.\n'
+              '-wal 파일이 누락되었을 수 있으니 [databases 폴더 선택]을 이용해보세요.';
     try {
       String? initialDir;
       if (Platform.isMacOS && _selectedService == 'service3') {
@@ -625,8 +662,16 @@ class _HomePageState extends State<HomePage> {
         return;
       }
 
+      if (_selectedService == 'service3' && _books.isNotEmpty) {
+        setState(() {
+          FolderScanner.matchBooksWithAladinPurchaseList(_books);
+        });
+      }
+
       if (devices.length == 1) {
-        final extractedId = devices.first.deviceId;
+        final extracted = devices.first;
+        _selectedDevice = extracted;
+        final extractedId = extracted.deviceId;
         _deviceIdController.text = extractedId;
         _serviceDeviceIds[_selectedService] = extractedId;
         _showTopNotification('디바이스 ID 추출 성공: $extractedId');
@@ -734,8 +779,16 @@ class _HomePageState extends State<HomePage> {
         return;
       }
 
+      if (_selectedService == 'service3' && _books.isNotEmpty) {
+        setState(() {
+          FolderScanner.matchBooksWithAladinPurchaseList(_books);
+        });
+      }
+
       if (devices.length == 1) {
-        final extractedId = devices.first.deviceId;
+        final extracted = devices.first;
+        _selectedDevice = extracted;
+        final extractedId = extracted.deviceId;
         _deviceIdController.text = extractedId;
         _serviceDeviceIds[_selectedService] = extractedId;
         _showTopNotification('디바이스 ID 추출 성공: $extractedId');
@@ -795,8 +848,12 @@ class _HomePageState extends State<HomePage> {
                     child: InkWell(
                       borderRadius: BorderRadius.circular(10),
                       onTap: () {
+                        _selectedDevice = device;
                         _deviceIdController.text = id;
                         _serviceDeviceIds[_selectedService] = id;
+                        if (_selectedService == 'service3' && _books.isNotEmpty) {
+                          FolderScanner.matchBooksWithAladinPurchaseList(_books);
+                        }
                         Navigator.of(ctx).pop();
                         _showTopNotification(
                           showDeviceName ? '디바이스 ID 선택 완료: $name ($id)' : '디바이스 ID 선택 완료: $id',
@@ -898,8 +955,12 @@ class _HomePageState extends State<HomePage> {
                             // 눈에 잘 띄는 V 선택 버튼
                             ElevatedButton.icon(
                               onPressed: () {
+                                _selectedDevice = device;
                                 _deviceIdController.text = id;
                                 _serviceDeviceIds[_selectedService] = id;
+                                if (_selectedService == 'service3' && _books.isNotEmpty) {
+                                  FolderScanner.matchBooksWithAladinPurchaseList(_books);
+                                }
                                 Navigator.of(ctx).pop();
                                 _showTopNotification(
                                   showDeviceName ? '디바이스 ID 선택 완료: $name ($id)' : '디바이스 ID 선택 완료: $id',
@@ -1032,6 +1093,13 @@ class _HomePageState extends State<HomePage> {
     try {
       final scanned = await FolderScanner.scanFolder(rawPath, serviceId: _selectedService);
       if (!mounted) return;
+      if (_selectedService == 'service3') {
+        if (FolderScanner.cachedAladinPurchaseList.isEmpty) {
+          await _reloadAladinMetadataIfNeeded(targets: scanned);
+        } else {
+          FolderScanner.matchBooksWithAladinPurchaseList(scanned);
+        }
+      }
       setState(() {
         _books = scanned;
         _isScanningFolder = false;
@@ -1077,27 +1145,115 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// 알라딘 도서 메타데이터(downloadKeyEnc 등)가 누락된 경우 data DB 파일을 자동으로 다시 로드하여 보정
+  Future<bool> _reloadAladinMetadataIfNeeded({List<BookItem>? targets}) async {
+    if (_selectedService != 'service3') return false;
+
+    // 만약 targets가 주어졌고 모든 도서에 downloadKeyEnc가 이미 설정되어 있다면 생략
+    if (targets != null &&
+        targets.isNotEmpty &&
+        targets.every((b) => b.downloadKeyEnc != null && b.downloadKeyEnc!.isNotEmpty)) {
+      return true;
+    }
+
+    // 만약 이미 캐시가 존재한다면 매칭만 먼저 시도
+    if (FolderScanner.cachedAladinPurchaseList.isNotEmpty) {
+      if (targets != null) {
+        FolderScanner.matchBooksWithAladinPurchaseList(targets);
+      }
+      FolderScanner.matchBooksWithAladinPurchaseList(_books);
+      if (targets == null ||
+          targets.every((b) => b.downloadKeyEnc != null && b.downloadKeyEnc!.isNotEmpty)) {
+        if (mounted) setState(() {});
+        return true;
+      }
+    }
+
+    // data DB 파일 경로 탐색
+    String? dataFilePath;
+    if (targets != null) {
+      for (final b in targets) {
+        if (b.metaFilePath != null && File(b.metaFilePath!).existsSync()) {
+          dataFilePath = b.metaFilePath;
+          break;
+        }
+      }
+    }
+    if (dataFilePath == null || dataFilePath.isEmpty) {
+      for (final b in _books) {
+        if (b.metaFilePath != null && File(b.metaFilePath!).existsSync()) {
+          dataFilePath = b.metaFilePath;
+          break;
+        }
+      }
+    }
+    dataFilePath ??= FolderScanner.getDefaultDeviceIdFilePath(
+      'service3',
+      currentLibraryPath: _folderPathController.text.trim(),
+    );
+
+    if (dataFilePath.isEmpty || !File(dataFilePath).existsSync()) {
+      return false;
+    }
+
+    try {
+      // ignore: avoid_print
+      final devices = await _apiService.extractDeviceIdFromFile(
+        rawUrl: _serverUrlController.text.trim(),
+        serviceId: 'service3',
+        filePath: dataFilePath,
+      );
+
+      // 디바이스 ID 입력창이 비어있다면 추출된 디바이스 ID 자동 반영
+      if (_deviceIdController.text.trim().isEmpty && devices.isNotEmpty) {
+        final pcDevice = devices.firstWhere(
+          (d) => d.deviceType == 'PC_Aladin' || d.deviceName.toLowerCase().contains('pc'),
+          orElse: () => devices.first,
+        );
+        _deviceIdController.text = pcDevice.deviceId;
+      }
+
+      // 갱신된 캐시로 도서 목록 재매칭
+      if (targets != null) {
+        FolderScanner.matchBooksWithAladinPurchaseList(targets);
+      }
+      FolderScanner.matchBooksWithAladinPurchaseList(_books);
+
+      if (mounted) setState(() {});
+      // ignore: avoid_print
+      return true;
+    } catch (e) {
+      // ignore: avoid_print
+      return false;
+    }
+  }
+
   // 11. 업로드 실행 - 선택 항목 업로드
-  void _uploadSelected() {
+  Future<void> _uploadSelected() async {
     final selectedBooks = _books.where((b) => b.isSelected).toList();
     if (selectedBooks.isEmpty) {
       _showSnackBar('업로드할 도서를 선택해주세요.', isError: true);
       return;
     }
+    await _reloadAladinMetadataIfNeeded(targets: selectedBooks);
     _runBatch(selectedBooks);
   }
 
   // 12. 업로드 실행 - 전체 항목 업로드
-  void _uploadAll() {
+  Future<void> _uploadAll() async {
     if (_books.isEmpty) {
       _showSnackBar('불러온 도서 목록이 없습니다.', isError: true);
       return;
     }
+    await _reloadAladinMetadataIfNeeded(targets: _books);
     _runBatch(_books);
   }
 
   // 일괄 업로드 파이프라인
   Future<void> _runBatch(List<BookItem> targets) async {
+    // 알라딘의 경우 downloadKeyEnc가 없는 항목이 있다면 data 파일 리로드 시도
+    await _reloadAladinMetadataIfNeeded(targets: targets);
+
     final deviceId = _deviceIdController.text.trim();
     if (deviceId.isEmpty) {
       _showSnackBar('디바이스 ID를 먼저 입력하거나 우측 [파일에서 추출]을 눌러주세요.', isError: true);
@@ -1107,10 +1263,6 @@ class _HomePageState extends State<HomePage> {
     final outDir = Directory(_outputDirController.text.trim());
     if (!await outDir.exists()) {
       await outDir.create(recursive: true);
-    }
-
-    if (_selectedService == 'service3') {
-      _showTopNotification('알라딘: 2026년 11월 업데이트 이전 버전에서만 사용할 수 있습니다');
     }
 
     setState(() {
@@ -1192,6 +1344,22 @@ class _HomePageState extends State<HomePage> {
           metaPath = null;
         }
 
+        // 알라딘의 경우 downloadKeyEnc가 여전히 누락되어 있다면 캐시에서 최후 매칭 시도
+        if (_selectedService == 'service3' && (book.downloadKeyEnc == null || book.downloadKeyEnc!.isEmpty)) {
+          final cleanItemId = book.bookNo ?? p.basename(book.path).replaceAll(RegExp(r'\.(epub_comic|epub|zip|cpub)$', caseSensitive: false), '');
+          final cachedItem = FolderScanner.cachedAladinPurchaseList.firstWhere(
+            (b) => b['itemId']?.toString().trim() == cleanItemId,
+            orElse: () => <String, dynamic>{},
+          );
+          if (cachedItem.isNotEmpty) {
+            book.downloadKeyEnc = cachedItem['downloadKeyEnc']?.toString();
+            book.downloadKeyId ??= cachedItem['downloadKeyId']?.toString();
+            if (cachedItem['title'] != null && cachedItem['title'].toString().isNotEmpty) {
+              book.detectedTitle = cachedItem['title'].toString();
+            }
+          }
+        }
+
         // 단계 2: 서버로 업로드 및 복호화 요청
         setState(() {
           book.status = BookStatus.uploading;
@@ -1209,6 +1377,9 @@ class _HomePageState extends State<HomePage> {
           clientBookPath: book.clientBookPath ?? book.path,
           bookNo: book.bookNo,
           userNo: book.userNo,
+          downloadKeyEnc: book.downloadKeyEnc,
+          downloadKeyId: book.downloadKeyId,
+          selectedDevice: _selectedDevice,
           clientType: 'flutter_client',
           removeWatermark: _removeWatermark,
           parallel: _enableParallelTransfer,
@@ -1246,7 +1417,9 @@ class _HomePageState extends State<HomePage> {
         String? savedFileName;
         for (final res in results) {
           if (_cancelRequested) break;
-          final targetSavePath = p.join(outDir.path, res.downloadFileName);
+          final cleanFileName = res.downloadFileName.replaceAll(RegExp(r'[\\/*?:"<>|\x00-\x1f]'), '_').trim();
+          final effectiveFileName = cleanFileName.isNotEmpty ? cleanFileName : res.downloadFileName;
+          final targetSavePath = p.join(outDir.path, effectiveFileName);
           await _apiService.downloadFile(
             rawUrl: _serverUrlController.text,
             token: res.token,
@@ -1520,7 +1693,7 @@ class _HomePageState extends State<HomePage> {
                                 SizedBox(width: 8),
                                 Expanded(
                                   child: Text(
-                                    '알라딘: 2026년 11월 업데이트 이전 버전만 사용할 수 있습니다.',
+                                    '2026.11 이상 버전인 경우 PowerShell에서 관리자 권한을 물어보면 모두 허용해주세요.',
                                     style: TextStyle(
                                       fontSize: 12,
                                       color: Colors.amberAccent,

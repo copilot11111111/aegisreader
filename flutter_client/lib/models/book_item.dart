@@ -22,6 +22,9 @@ class BookItem {
   final String? userNo;
   String? detectedTitle;
   String? savedFileName;
+  String? downloadKeyId;
+  String? downloadKeyEnc;
+  int? drmType;
 
   bool isSelected;
   BookStatus status;
@@ -44,6 +47,9 @@ class BookItem {
     this.userNo,
     this.detectedTitle,
     this.savedFileName,
+    this.downloadKeyId,
+    this.downloadKeyEnc,
+    this.drmType,
     this.isSelected = true,
     this.status = BookStatus.idle,
     this.progress = 0.0,

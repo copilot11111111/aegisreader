@@ -229,7 +229,6 @@ class AegisReaderApiService {
     ));
 
     // Windows OS 커널 TCP Window Scaling(16MB) 및 다중 영구 커넥션 풀(최대 32개) 최적화
-    // (참고: Dart package:http2는 64KB user-space flow control 제한으로 인해 300ms 고지연 WAN에서 0.1MB/s로 속도가 병목됨)
     (_dio.httpClientAdapter as IOHttpClientAdapter).createHttpClient = () {
       final client = HttpClient();
       client.maxConnectionsPerHost = 32;
@@ -415,6 +414,16 @@ class AegisReaderApiService {
       } catch (_) {}
     }
 
+    // 알라딘(service3)의 경우 DB 암호화 키를 확인하고 TPM/DPAPI 복호화하여 file_key로 첨부
+    if (serviceId == 'service3') {
+      try {
+        final keyStr = await FolderScanner.getAladinDecryptedKey(filePath);
+        if (keyStr != null && keyStr.isNotEmpty) {
+          formMap['file_key'] = keyStr;
+        }
+      } catch (_) {}
+    }
+
     // 알라딘(service3)의 경우 SQLite WAL(-wal, -shm) 파일이 존재하고 읽기 가능하면 함께 전송하여 커밋되지 않은 최신 Device ID 복원
     if (serviceId == 'service3') {
       final targetWalPath = walFilePath ?? '${file.path}-wal';
@@ -465,13 +474,48 @@ class AegisReaderApiService {
     );
 
     if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
+      // 알라딘(service3)의 경우 함께 응답된 books / purchaseList(도서 메타데이터)를 캐싱
+      if (serviceId == 'service3') {
+        final rawPurchaseList = (response.data['books'] ?? response.data['purchaseList']) as List<dynamic>?;
+        if (rawPurchaseList != null && rawPurchaseList.isNotEmpty) {
+          FolderScanner.cacheAladinPurchaseList(rawPurchaseList);
+        }
+        if (response.data['user'] != null) {
+          FolderScanner.cacheAladinUser(response.data['user']);
+        }
+      }
+
       final rawDevices = response.data['devices'] as List<dynamic>?;
       if (rawDevices != null && rawDevices.isNotEmpty) {
-        return rawDevices
+        final devices = rawDevices
             .whereType<Map<String, dynamic>>()
             .map((e) => ExtractedDevice.fromJson(e))
             .where((d) => d.deviceId.isNotEmpty)
             .toList();
+
+        // 알라딘(service3)의 경우 data 테이블 내부 ID 값이 TPM1: 또는 DP1:으로 암호화되어 있을 수 있으므로
+        // CngKey로 복호화 처리하여 반환
+        if (serviceId == 'service3') {
+          final rawIds = devices.map((d) => d.deviceId).toList();
+          if (rawIds.any((id) => id.startsWith('TPM1:') || id.startsWith('DP1:'))) {
+            try {
+              final decryptedIds = await FolderScanner.decryptAladinStrings(rawIds);
+              if (decryptedIds.length == devices.length) {
+                return List.generate(
+                  devices.length,
+                  (i) => ExtractedDevice(
+                    deviceId: decryptedIds[i],
+                    deviceName: devices[i].deviceName,
+                    deviceType: devices[i].deviceType,
+                    isAuth: devices[i].isAuth,
+                  ),
+                );
+              }
+            } catch (_) {}
+          }
+        }
+
+        return devices;
       }
 
       final ids = (response.data['deviceIds'] as List<dynamic>?)
@@ -479,6 +523,16 @@ class AegisReaderApiService {
               .where((id) => id.isNotEmpty)
               .toList() ??
           [];
+
+      if (serviceId == 'service3' && ids.any((id) => id.startsWith('TPM1:') || id.startsWith('DP1:'))) {
+        try {
+          final decrypted = await FolderScanner.decryptAladinStrings(ids);
+          if (decrypted.length == ids.length) {
+            return decrypted.map((id) => ExtractedDevice(deviceId: id)).toList();
+          }
+        } catch (_) {}
+      }
+
       return ids.map((id) => ExtractedDevice(deviceId: id)).toList();
     } else {
       final msg = extractServerErrorMessage(response.data) ?? 'Device ID 추출 실패';
@@ -513,6 +567,292 @@ class AegisReaderApiService {
     }
   }
 
+  /// 도서 본문 복호화 키(contentKey)를 API 호출을 통해 조회
+  Future<String?> fetchBookKey({
+    String? rawUrl,
+    required String serviceId,
+    required String itemId,
+    String? deviceId,
+    String? downloadKeyId,
+  }) async {
+    final apiUrl = normalizeApiUrl(rawUrl);
+    try {
+      final response = await _dio.get(
+        '$apiUrl/book/key',
+        queryParameters: {
+          'service': serviceId,
+          'itemId': itemId.trim(),
+          if (deviceId != null && deviceId.trim().isNotEmpty) 'deviceId': deviceId.trim(),
+          if (downloadKeyId != null && downloadKeyId.trim().isNotEmpty) 'downloadKeyId': downloadKeyId.trim(),
+        },
+        options: Options(
+          sendTimeout: const Duration(seconds: 15),
+          receiveTimeout: const Duration(seconds: 15),
+        ),
+      );
+
+      if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
+        final key = response.data['contentKey']?.toString().trim();
+        if (key != null && key.isNotEmpty) {
+          return key;
+        }
+      }
+    } catch (e) {
+      // POST 폴백 시도
+      try {
+        final response = await _dio.post(
+          '$apiUrl/book/key',
+          data: {
+            'service': serviceId,
+            'itemId': itemId.trim(),
+            if (deviceId != null && deviceId.trim().isNotEmpty) 'deviceId': deviceId.trim(),
+            if (downloadKeyId != null && downloadKeyId.trim().isNotEmpty) 'downloadKeyId': downloadKeyId.trim(),
+          },
+          options: Options(
+            sendTimeout: const Duration(seconds: 15),
+            receiveTimeout: const Duration(seconds: 15),
+          ),
+        );
+        if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
+          final key = response.data['contentKey']?.toString().trim();
+          if (key != null && key.isNotEmpty) {
+            return key;
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  // service3 라이선스 파라미터 처리
+  Future<Map<String, String>?> fetchAladinLicenseParams({
+    String? rawUrl,
+    required String itemId,
+    required String deviceId,
+    String? metaFilePath,
+    void Function(String msg)? onStatusUpdate,
+  }) async {
+    final apiUrl = normalizeApiUrl(rawUrl);
+    try {
+      final cleanItemId = itemId.trim();
+      var cachedItem = FolderScanner.cachedAladinPurchaseList.firstWhere(
+        (b) => b['itemId']?.toString().trim() == cleanItemId,
+        orElse: () => <String, dynamic>{},
+      );
+      var user = FolderScanner.cachedAladinUser;
+
+      // 캐시된 purchaseList에 해당 도서가 없거나 user 정보가 비어있다면, metaFilePath를 통해 /deviceid 동기화 시도
+      if ((cachedItem.isEmpty || user == null) && metaFilePath != null && metaFilePath.isNotEmpty) {
+        try {
+          onStatusUpdate?.call('도서 메타데이터 자동 동기화 중...');
+          await extractDeviceIdFromFile(
+            rawUrl: rawUrl,
+            filePath: metaFilePath,
+            serviceId: 'service3',
+          );
+          cachedItem = FolderScanner.cachedAladinPurchaseList.firstWhere(
+            (b) => b['itemId']?.toString().trim() == cleanItemId,
+            orElse: () => <String, dynamic>{},
+          );
+          user = FolderScanner.cachedAladinUser;
+        } catch (e) {
+          // ignore: avoid_print
+        }
+      }
+
+      final orderNo = cachedItem['orderNo']?.toString().trim() ?? '';
+      final ebookId = cachedItem['ebookId']?.toString().trim() ?? '';
+      if (orderNo.isEmpty || ebookId.isEmpty) {
+        throw Exception('도서 메타데이터(orderNo 또는 ebookId)를 찾을 수 없습니다: $cleanItemId');
+      }
+
+      user = FolderScanner.cachedAladinUser;
+      int custKey = 0;
+      String rawAuthToken = '';
+      if (user != null) {
+        if (user['custKey'] is num) {
+          custKey = (user['custKey'] as num).toInt();
+        } else if (user['custKey'] != null) {
+          custKey = int.tryParse(user['custKey'].toString()) ?? 0;
+        }
+        rawAuthToken = user['authToken']?.toString().trim() ?? '';
+      }
+
+      String jwt = '';
+      String customerId = '';
+      if (rawAuthToken.isNotEmpty) {
+        final decList = await FolderScanner.decryptAladinStrings([rawAuthToken]);
+        if (decList.isNotEmpty && decList.first.startsWith('eyJ')) {
+          jwt = decList.first;
+        }
+      }
+
+      if (jwt.isEmpty) {
+        throw Exception(
+          '알라딘 로그인 인증 토큰이 없거나 복호화되지 않았습니다.',
+        );
+      }
+
+      // JWT payload 파싱하여 customer_id 및 custKey 도출
+      if (customerId.isEmpty || custKey <= 0) {
+        try {
+          final parts = jwt.split('.');
+          if (parts.length >= 2) {
+            String normalized = parts[1];
+            while (normalized.length % 4 != 0) {
+              normalized += '=';
+            }
+            final payloadJson = jsonDecode(utf8.decode(base64Url.decode(normalized)));
+            if (payloadJson is Map) {
+              if (customerId.isEmpty && payloadJson['customer_id'] != null) {
+                customerId = payloadJson['customer_id'].toString().trim();
+              }
+              if (custKey <= 0 && payloadJson['sub'] != null) {
+                custKey = int.tryParse(payloadJson['sub'].toString()) ?? 0;
+              }
+            }
+          }
+        } catch (e) {
+          throw Exception('알라딘 JWT 페이로드 파싱 실패: $e');
+        }
+      }
+
+      if (customerId.isEmpty) {
+        throw Exception('알라딘 JWT에서 customer_id를 파싱하지 못했습니다.');
+      }
+
+      onStatusUpdate?.call('라이선스 요청 중...');
+      final dio1 = Dio();
+      final res1 = await dio1.post(
+        'https://sync.ebook.aladin.co.kr/Service/LicenseService/api/v1/drm/license/$customerId',
+        data: {
+          'custKey': custKey,
+          'orderNo': orderNo,
+          'itemId': int.tryParse(cleanItemId) ?? 0,
+          'ebookId': ebookId,
+          'productCode': 0,
+          'productType': 0,
+          'saleType': 1,
+          'rentPeriod': 0,
+          'deviceInfo': {
+            'deviceId': deviceId.trim(),
+            'deviceName': 'PC',
+            'deviceType': 'PC_Aladin',
+          },
+          'trace': {
+            'applicationVersion': '2026.11.1.0',
+            'deviceModel': 'PC_Aladin',
+          },
+        },
+        options: Options(
+          headers: {
+            'Authorization': 'Bearer $jwt',
+            'User-Agent': 'AladinEbookViewer/2026.11.1.0',
+            'Content-Type': 'application/json',
+          },
+          sendTimeout: const Duration(seconds: 15),
+          receiveTimeout: const Duration(seconds: 15),
+        ),
+      );
+
+      final licB64 = (res1.data is Map) ? res1.data['license']?.toString() : null;
+      if (licB64 == null || licB64.isEmpty) {
+        final errMsg = (res1.data is Map && res1.data['resultMessage'] != null)
+            ? res1.data['resultMessage'].toString()
+            : '응답에 license 데이터가 없습니다.';
+        throw Exception(errMsg);
+      }
+
+      // 백엔드에서 쿼리 생성
+      onStatusUpdate?.call('백엔드에서 쿼리 생성 중...');
+      final step1Res = await _dio.post(
+        '$apiUrl/service3/license/step1',
+        data: {
+          'license': licB64,
+          'deviceId': deviceId.trim(),
+        },
+        options: Options(
+          sendTimeout: const Duration(seconds: 15),
+          receiveTimeout: const Duration(seconds: 15),
+        ),
+      );
+
+      if (step1Res.statusCode != 200 || step1Res.data is! Map) {
+        final errMsg = extractServerErrorMessage(step1Res.data) ?? '라이선스 파싱 실패';
+        throw Exception(errMsg);
+      }
+      final s1 = step1Res.data as Map;
+      final uuid = s1['uuid']?.toString() ?? '';
+      final downUrl = s1['downUrl']?.toString() ?? '';
+      final drmOrd = s1['drmOrd']?.toString() ?? '';
+      if (uuid.isEmpty || drmOrd.isEmpty) {
+        throw Exception('백엔드 파싱 결과 UUID 또는 DRM_ORD가 누락되었습니다.');
+      }
+
+      String postBody = s1['postBody']?.toString() ?? '';
+      String kParam = s1['kParam']?.toString() ?? '';
+
+      // 만약 백엔드에서 postBody가 오지 않은 경우
+      if (postBody.isEmpty || kParam.isEmpty) {
+        final genRes = await _dio.post(
+          '$apiUrl/service3/license/generate-query',
+          data: {
+            'deviceId': deviceId.trim(),
+            'uuid': uuid,
+            'drmOrd': drmOrd,
+            'downUrl': downUrl,
+          },
+          options: Options(
+            sendTimeout: const Duration(seconds: 15),
+            receiveTimeout: const Duration(seconds: 15),
+          ),
+        );
+        if (genRes.statusCode == 200 && genRes.data is Map) {
+          postBody = genRes.data['postBody']?.toString() ?? '';
+          kParam = genRes.data['kParam']?.toString() ?? '';
+        }
+      }
+
+      if (postBody.isEmpty || kParam.isEmpty) {
+        throw Exception('백엔드에서 쿼리를 생성하지 못했습니다.');
+      }
+
+      onStatusUpdate?.call('라이선스 발급 요청 중...');
+      final dio2 = Dio();
+      final res2 = await dio2.post(
+        'https://sync.ebook.aladin.co.kr/Service/LicenseService/secure/api/Content/license',
+        data: postBody,
+        options: Options(
+          headers: {
+            'Authorization': 'Bearer $jwt',
+            'User-Agent': 'AladinEbookViewer/2026.11.1.0',
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          responseType: ResponseType.plain,
+          sendTimeout: const Duration(seconds: 15),
+          receiveTimeout: const Duration(seconds: 15),
+        ),
+      );
+
+      final secondXml = res2.data?.toString().trim() ?? '';
+      if (secondXml.isEmpty || !secondXml.contains('<LICENSE')) {
+        throw Exception('라이선스 발급 실패: 응답 XML이 올바르지 않습니다');
+      }
+
+      return {
+        'secondXml': secondXml,
+        'kParam': kParam,
+        'uuid': uuid,
+        'drmOrd': drmOrd,
+        'downUrl': downUrl,
+      };
+    } catch (e) {
+      // ignore: avoid_print
+      print('[fetchAladinLicenseParams] Error: $e');
+      rethrow;
+    }
+  }
+
   /// 4. 도서 파일 복호화 요청
   /// POST /api/decrypt (multipart: service, deviceId, files, datFiles, metaFile, clientBookPath, bookNo, clientType, removeWatermark)
   /// 100MB 초과 도서의 경우 단일 요청 100MB 제한을 방어하기 위해 자동으로 50MB 단위 분할 업로드(Chunked Upload) 수행
@@ -526,6 +866,9 @@ class AegisReaderApiService {
     String? clientBookPath,
     String? bookNo,
     String? userNo,
+    String? downloadKeyEnc,
+    String? downloadKeyId,
+    ExtractedDevice? selectedDevice,
     String clientType = 'flutter_client',
     bool removeWatermark = false,
     bool parallel = true,
@@ -542,10 +885,97 @@ class AegisReaderApiService {
     final fileLength = await bookFile.length();
 
     String? metaKey;
+    String? aladinPrivKey;
+    String? aladinContentKey;
+    String? aladinDownloadKeyId = downloadKeyId;
+    Map<String, String>? aladinStep2Params;
+
     if (serviceId == 'service2') {
       try {
         metaKey = await FolderScanner.getYes24DecryptedKey(metaFilePath);
       } catch (_) {}
+    } else if (serviceId == 'service3') {
+      try {
+        metaKey = await FolderScanner.getAladinDecryptedKey(metaFilePath);
+      } catch (_) {}
+
+      // 알라딘 도서 복호화 키 확인
+      final effectiveItemId = (bookNo != null && bookNo.trim().isNotEmpty)
+          ? bookNo.trim()
+          : p.basename(filePath).replaceAll(RegExp(r'\.(epub_comic|epub|zip|cpub)$', caseSensitive: false), '').trim();
+
+      if (effectiveItemId.isNotEmpty && Platform.isWindows) {
+        onStatusUpdate?.call('도서 권한 키 확인 중...');
+        try {
+          String? effectiveEnc = downloadKeyEnc;
+          String? effectiveDlKeyId = downloadKeyId;
+
+          // downloadKeyEnc가 전달되지 않았고 캐시가 있다면 캐시에서 itemId로 탐색
+          if ((effectiveEnc == null || effectiveEnc.isEmpty) && FolderScanner.cachedAladinPurchaseList.isNotEmpty) {
+            final cached = FolderScanner.cachedAladinPurchaseList.firstWhere(
+              (b) => b['itemId']?.toString().trim() == effectiveItemId,
+              orElse: () => <String, dynamic>{},
+            );
+            if (cached.isNotEmpty) {
+              effectiveEnc = cached['downloadKeyEnc']?.toString();
+              effectiveDlKeyId ??= cached['downloadKeyId']?.toString();
+            }
+          }
+
+          // 1. 관리자 권한을 요청한 CNG 스크립트로 downloadKeyEnc 복호화 -> privKey(32B hex) 도출
+          final v4Keys = await FolderScanner.extractAladinV4Keys(
+            itemId: effectiveItemId,
+            downloadKeyEnc: effectiveEnc,
+            downloadKeyId: effectiveDlKeyId,
+            dataDbPath: metaFilePath,
+            metaKey: metaKey,
+            device: selectedDevice,
+          );
+          if (v4Keys != null) {
+            aladinPrivKey = v4Keys.privKey;
+            if (v4Keys.downloadKeyId != null && v4Keys.downloadKeyId!.isNotEmpty) {
+              aladinDownloadKeyId = v4Keys.downloadKeyId;
+            }
+            if ((metaKey == null || metaKey.isEmpty) && v4Keys.metaKey != null && v4Keys.metaKey!.isNotEmpty) {
+              metaKey = v4Keys.metaKey;
+            }
+          }
+        } catch (_) {}
+
+        // 라이선스 데이터 획득
+        try {
+          onStatusUpdate?.call('도서 라이선스 발급 요청 중...');
+          aladinStep2Params = await fetchAladinLicenseParams(
+            rawUrl: rawUrl,
+            itemId: effectiveItemId,
+            deviceId: deviceId,
+            metaFilePath: metaFilePath,
+            onStatusUpdate: onStatusUpdate,
+          );
+          if (aladinStep2Params != null) {
+            // ignore: avoid_print
+          }
+        } catch (e) {
+          // ignore: avoid_print
+        }
+
+        // 3. 기존 저장된 키(contentKey)가 있는지 폴백 조회 (legacy/cache)
+        if (aladinStep2Params == null) {
+          try {
+            onStatusUpdate?.call('도서 라이선스 키 확인 중...');
+            final fetchedKey = await fetchBookKey(
+              rawUrl: rawUrl,
+              serviceId: serviceId,
+              itemId: effectiveItemId,
+              deviceId: deviceId,
+              downloadKeyId: aladinDownloadKeyId,
+            );
+            if (fetchedKey != null && fetchedKey.isNotEmpty) {
+              aladinContentKey = fetchedKey;
+            }
+          } catch (_) {}
+        }
+      }
     }
 
     // 1. 단일 요청 모드 (!parallel) 이거나 파일 크기가 분할 기준 이하인 경우:
@@ -561,6 +991,16 @@ class AegisReaderApiService {
         if (bookNo != null && bookNo.isNotEmpty) 'bookNo': bookNo,
         if (userNo != null && userNo.isNotEmpty) 'userno': userNo,
         if (metaKey != null && metaKey.isNotEmpty) 'metaKey': metaKey,
+        if (aladinPrivKey != null && aladinPrivKey.isNotEmpty) 'privKey': aladinPrivKey,
+        if (aladinContentKey != null && aladinContentKey.isNotEmpty) 'contentKey': aladinContentKey,
+        if (aladinDownloadKeyId != null && aladinDownloadKeyId.isNotEmpty) 'downloadKeyId': aladinDownloadKeyId,
+        if (aladinStep2Params != null) ...{
+          if (aladinStep2Params['secondXml'] != null) 'secondXml': aladinStep2Params['secondXml']!,
+          if (aladinStep2Params['kParam'] != null) 'kParam': aladinStep2Params['kParam']!,
+          if (aladinStep2Params['uuid'] != null) 'uuid': aladinStep2Params['uuid']!,
+          if (aladinStep2Params['drmOrd'] != null) 'drmOrd': aladinStep2Params['drmOrd']!,
+          if (aladinStep2Params['downUrl'] != null) 'downUrl': aladinStep2Params['downUrl']!,
+        },
         'files': await MultipartFile.fromFile(
           bookFile.path,
           filename: p.basename(bookFile.path),
@@ -603,6 +1043,9 @@ class AegisReaderApiService {
               'x-client-book-path': Uri.encodeComponent(clientBookPath),
             if (bookNo != null && bookNo.isNotEmpty) 'x-book-no': bookNo,
             if (metaKey != null && metaKey.isNotEmpty) 'x-meta-key': metaKey,
+            if (aladinPrivKey != null && aladinPrivKey.isNotEmpty) 'x-priv-key': aladinPrivKey,
+            if (aladinContentKey != null && aladinContentKey.isNotEmpty) 'x-content-key': aladinContentKey,
+            if (aladinDownloadKeyId != null && aladinDownloadKeyId.isNotEmpty) 'x-download-key-id': aladinDownloadKeyId,
           },
         ),
         onSendProgress: (sent, total) {
@@ -760,6 +1203,19 @@ class AegisReaderApiService {
                 'datFiles': MultipartFile.fromBytes(datBytes, filename: datFileName),
               if (chunkIndex == 0 && metaKey != null && metaKey.isNotEmpty)
                 'metaKey': metaKey,
+              if (chunkIndex == 0 && aladinPrivKey != null && aladinPrivKey.isNotEmpty)
+                'privKey': aladinPrivKey,
+              if (chunkIndex == 0 && aladinContentKey != null && aladinContentKey.isNotEmpty)
+                'contentKey': aladinContentKey,
+              if (chunkIndex == 0 && aladinDownloadKeyId != null && aladinDownloadKeyId.isNotEmpty)
+                'downloadKeyId': aladinDownloadKeyId,
+              if (chunkIndex == 0 && aladinStep2Params != null) ...{
+                if (aladinStep2Params['secondXml'] != null) 'secondXml': aladinStep2Params['secondXml']!,
+                if (aladinStep2Params['kParam'] != null) 'kParam': aladinStep2Params['kParam']!,
+                if (aladinStep2Params['uuid'] != null) 'uuid': aladinStep2Params['uuid']!,
+                if (aladinStep2Params['drmOrd'] != null) 'drmOrd': aladinStep2Params['drmOrd']!,
+                if (aladinStep2Params['downUrl'] != null) 'downUrl': aladinStep2Params['downUrl']!,
+              },
             };
 
             final currentFormData = FormData.fromMap(formMap);
@@ -776,6 +1232,9 @@ class AegisReaderApiService {
                     'x-client-book-path': Uri.encodeComponent(clientBookPath),
                   if (bookNo != null && bookNo.isNotEmpty) 'x-book-no': bookNo,
                   if (metaKey != null && metaKey.isNotEmpty) 'x-meta-key': metaKey,
+                  if (aladinPrivKey != null && aladinPrivKey.isNotEmpty) 'x-priv-key': aladinPrivKey,
+                  if (aladinContentKey != null && aladinContentKey.isNotEmpty) 'x-content-key': aladinContentKey,
+                  if (aladinDownloadKeyId != null && aladinDownloadKeyId.isNotEmpty) 'x-download-key-id': aladinDownloadKeyId,
                 },
               ),
               cancelToken: cancelToken,
