@@ -345,59 +345,95 @@ class FolderScanner {
     _cachedYes24DecryptedKey = null;
   }
 
-  /// 예스24 Realm 암호화 키를 확인하고 DPAPI 복호화하여 Base64 문자열로 반환
+  /// 예스24 Realm 암호화 키(.key / .key.m)를 확인하고 DPAPI 복호화하여 Base64 문자열로 반환
   static Future<String?> getYes24DecryptedKey([String? realmPath]) async {
     if (_cachedYes24DecryptedKey != null && _cachedYes24DecryptedKey!.isNotEmpty) {
       return _cachedYes24DecryptedKey;
     }
 
     final appData = Platform.environment['APPDATA'] ?? '';
-    final candidates = <String>[];
+    final rawCandidates = <String>[];
     if (realmPath != null && realmPath.trim().isNotEmpty) {
-      candidates.add('$realmPath.key');
-      candidates.add(p.join(p.dirname(realmPath), 'Yes24eBook.realm.key'));
+      rawCandidates.add('$realmPath.key');
+      rawCandidates.add('$realmPath.key.m');
+      rawCandidates.add(p.join(p.dirname(realmPath), 'Yes24eBook.realm.key'));
+      rawCandidates.add(p.join(p.dirname(realmPath), 'Yes24eBook.realm.key.m'));
     }
     if (appData.isNotEmpty) {
-      candidates.add(p.join(appData, 'Yes24eBook', '.db', 'Yes24eBook.realm.key'));
-      candidates.add(p.join(appData, 'Yes24eBook', 'Yes24eBook.realm.key'));
+      rawCandidates.add(p.join(appData, 'Yes24eBook', '.db', 'Yes24eBook.realm.key'));
+      rawCandidates.add(p.join(appData, 'Yes24eBook', '.db', 'Yes24eBook.realm.key.m'));
+      rawCandidates.add(p.join(appData, 'Yes24eBook', 'Yes24eBook.realm.key'));
+      rawCandidates.add(p.join(appData, 'Yes24eBook', 'Yes24eBook.realm.key.m'));
     }
 
-    String? keyFilePath;
-    for (final c in candidates) {
+    final seen = <String>{};
+    final existingPaths = <String>[];
+    for (final c in rawCandidates) {
+      if (c.isEmpty || !seen.add(c)) continue;
       if (File(c).existsSync()) {
-        keyFilePath = c;
-        break;
+        existingPaths.add(c);
       }
     }
 
-    if (keyFilePath == null) return null;
+    if (existingPaths.isEmpty) return null;
 
-    try {
-      final bytes = await File(keyFilePath).readAsBytes();
-      if (bytes.length == 64) {
-        final b64 = base64Encode(bytes);
-        _cachedYes24DecryptedKey = b64;
-        return b64;
-      }
+    // 1. 평문 64바이트 / 128자리 Hex / 88자리 Base64 키 우선 확인
+    for (final kp in existingPaths) {
+      try {
+        final bytes = await File(kp).readAsBytes();
+        if (bytes.length == 64) {
+          final b64 = base64Encode(bytes);
+          _cachedYes24DecryptedKey = b64;
+          return b64;
+        }
+        final text = utf8.decode(bytes, allowMalformed: true).trim();
+        if (RegExp(r'^[0-9a-fA-F]{128}$').hasMatch(text)) {
+          final hexBytes = Uint8List(64);
+          for (int i = 0; i < 64; i++) {
+            hexBytes[i] = int.parse(text.substring(i * 2, i * 2 + 2), radix: 16);
+          }
+          final b64 = base64Encode(hexBytes);
+          _cachedYes24DecryptedKey = b64;
+          return b64;
+        }
+        final b64Match = RegExp(r'[A-Za-z0-9+/]{86}==').firstMatch(text);
+        if (b64Match != null) {
+          final b64 = b64Match.group(0)!;
+          _cachedYes24DecryptedKey = b64;
+          return b64;
+        }
+      } catch (_) {}
+    }
 
-      if (Platform.isWindows) {
-        final cleanPath = keyFilePath.replaceAll("'", "''");
+    // 2. Windows DPAPI(.key: CurrentUser / .key.m: LocalMachine) 복호화 시도
+    if (Platform.isWindows) {
+      try {
+        final quotedPaths = existingPaths
+            .map((e) => "'${e.replaceAll("'", "''")}'")
+            .join(', ');
         final psScript = '''
 \$ProgressPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Security
-try {
-  \$b = [System.IO.File]::ReadAllBytes('$cleanPath')
-  \$e = [System.Text.Encoding]::UTF8.GetBytes('Yes24eBook.Realm.EncryptionKey')
-  \$k = \$null
+\$e = [System.Text.Encoding]::UTF8.GetBytes('Yes24eBook.Realm.EncryptionKey')
+\$paths = @($quotedPaths)
+foreach (\$kp in \$paths) {
   try {
-    \$k = [System.Security.Cryptography.ProtectedData]::Unprotect(\$b, \$e, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-  } catch {
-    \$k = [System.Security.Cryptography.ProtectedData]::Unprotect(\$b, \$e, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
-  }
-  if (\$k -and \$k.Length -eq 64) {
-    Write-Output [System.Convert]::ToBase64String(\$k)
-  }
-} catch {}
+    if (-not (Test-Path -LiteralPath \$kp)) { continue }
+    \$b = [System.IO.File]::ReadAllBytes(\$kp)
+    \$k = \$null
+    try {
+      \$k = [System.Security.Cryptography.ProtectedData]::Unprotect(\$b, \$e, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    } catch {
+      try {
+        \$k = [System.Security.Cryptography.ProtectedData]::Unprotect(\$b, \$e, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
+      } catch {}
+    }
+    if (\$k -and \$k.Length -eq 64) {
+      Write-Output [System.Convert]::ToBase64String(\$k)
+      break
+    }
+  } catch {}
+}
 ''';
 
         final encoded = _encodePowerShellScript(psScript);
@@ -415,18 +451,10 @@ try {
             return _cachedYes24DecryptedKey;
           }
         }
-      }
-
-      // 64바이트 원본 키인 경우에만 Base64 반환
-      if (bytes.length == 64) {
-        final b64 = base64Encode(bytes);
-        _cachedYes24DecryptedKey = b64;
-        return b64;
-      }
-      return null;
-    } catch (_) {
-      return null;
+      } catch (_) {}
     }
+
+    return null;
   }
 
   static String? _cachedAladinDecryptedKey;
@@ -809,12 +837,15 @@ foreach (\$line in \$lines) {
         final itemId = pItem['itemId']?.toString().trim() ?? '';
         final title = pItem['title']?.toString().trim() ?? '';
         final filePath = pItem['filePath']?.toString().trim() ?? '';
+        final ebookId = pItem['ebookId']?.toString().trim().toLowerCase() ?? '';
         final filePathNorm = filePath.replaceAll('\\', '/').toLowerCase();
 
         bool matched = false;
         if (cleanBookNo.isNotEmpty && itemId.isNotEmpty && cleanBookNo == itemId) {
           matched = true;
         } else if (fileName.isNotEmpty && itemId.isNotEmpty && fileName == itemId) {
+          matched = true;
+        } else if (ebookId.isNotEmpty && (fileName.toLowerCase() == ebookId || bookPathNorm.contains(ebookId))) {
           matched = true;
         } else if (filePathNorm.isNotEmpty && (bookPathNorm.endsWith(filePathNorm) || filePathNorm.endsWith(bookPathNorm))) {
           matched = true;
