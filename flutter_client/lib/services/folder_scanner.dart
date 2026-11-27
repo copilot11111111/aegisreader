@@ -1,9 +1,43 @@
 import 'dart:convert';
+import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:ffi/ffi.dart';
 import 'package:path/path.dart' as p;
 import '../models/book_item.dart';
 import '../models/extracted_device.dart';
+
+final class _CryptoApiBlob extends Struct {
+  @Uint32()
+  external int cbData;
+
+  external Pointer<Uint8> pbData;
+}
+
+typedef _CryptUnprotectDataNative = Int32 Function(
+  Pointer<_CryptoApiBlob> pDataIn,
+  Pointer<Pointer<Utf16>> ppszDataDescr,
+  Pointer<_CryptoApiBlob> pOptionalEntropy,
+  Pointer<Void> pvReserved,
+  Pointer<Void> pPromptStruct,
+  Uint32 dwFlags,
+  Pointer<_CryptoApiBlob> pDataOut,
+);
+
+typedef _CryptUnprotectDataDart = int Function(
+  Pointer<_CryptoApiBlob> pDataIn,
+  Pointer<Pointer<Utf16>> ppszDataDescr,
+  Pointer<_CryptoApiBlob> pOptionalEntropy,
+  Pointer<Void> pvReserved,
+  Pointer<Void> pPromptStruct,
+  int dwFlags,
+  Pointer<_CryptoApiBlob> pDataOut,
+);
+
+typedef _LocalFreeNative = Pointer<Void> Function(Pointer<Void> hMem);
+typedef _LocalFreeDart = Pointer<Void> Function(Pointer<Void> hMem);
+
+const int _cryptProtectUiForbidden = 0x1;
 
 class FolderScanner {
   /// macOS 환경에서 /usr/bin/sqlite3를 실행하여 누적된 -wal 로그를 메인 DB로 강제 체크포인트(TRUNCATE)하여 병합
@@ -338,26 +372,184 @@ class FolderScanner {
     }
   }
 
-  static String? _cachedYes24DecryptedKey;
+  static const String _yes24RealmEntropy = 'Yes24eBook.Realm.EncryptionKey';
+  static final Map<String, String> _cachedYes24DecryptedKeys = {};
 
   /// 예스24 Realm 복호화 키 캐시를 초기화합니다.
   static void clearYes24DecryptedKeyCache() {
-    _cachedYes24DecryptedKey = null;
+    _cachedYes24DecryptedKeys.clear();
+  }
+
+  /// Windows DPAPI(CryptUnprotectData) 네이티브 FFI 호출
+  static Uint8List? _decryptWindowsDpapiBlobFfi(Uint8List blobBytes, String entropy) {
+    if (!Platform.isWindows || blobBytes.isEmpty) return null;
+
+    final crypt32 = DynamicLibrary.open('crypt32.dll');
+    final kernel32 = DynamicLibrary.open('kernel32.dll');
+    final cryptUnprotectData = crypt32.lookupFunction<_CryptUnprotectDataNative, _CryptUnprotectDataDart>(
+      'CryptUnprotectData',
+    );
+    final localFree = kernel32.lookupFunction<_LocalFreeNative, _LocalFreeDart>('LocalFree');
+
+    final pInBytes = calloc<Uint8>(blobBytes.length);
+    final pDataIn = calloc<_CryptoApiBlob>();
+    final pDataOut = calloc<_CryptoApiBlob>();
+    Pointer<Uint8>? pEntropyBytes;
+    Pointer<_CryptoApiBlob>? pEntropy;
+
+    try {
+      pInBytes.asTypedList(blobBytes.length).setAll(0, blobBytes);
+      pDataIn.ref.cbData = blobBytes.length;
+      pDataIn.ref.pbData = pInBytes;
+
+      if (entropy.isNotEmpty) {
+        final entList = utf8.encode(entropy);
+        pEntropyBytes = calloc<Uint8>(entList.length);
+        pEntropyBytes.asTypedList(entList.length).setAll(0, entList);
+        pEntropy = calloc<_CryptoApiBlob>();
+        pEntropy.ref.cbData = entList.length;
+        pEntropy.ref.pbData = pEntropyBytes;
+      }
+
+      final ok = cryptUnprotectData(
+        pDataIn,
+        nullptr,
+        pEntropy ?? nullptr,
+        nullptr,
+        nullptr,
+        _cryptProtectUiForbidden,
+        pDataOut,
+      );
+
+      if (ok == 0 || pDataOut.ref.cbData <= 0 || pDataOut.ref.pbData == nullptr) {
+        return null;
+      }
+
+      return Uint8List.fromList(pDataOut.ref.pbData.asTypedList(pDataOut.ref.cbData));
+    } finally {
+      if (pDataOut.ref.pbData != nullptr) {
+        localFree(pDataOut.ref.pbData.cast<Void>());
+      }
+      calloc.free(pDataOut);
+      if (pEntropy != null) calloc.free(pEntropy);
+      if (pEntropyBytes != null) calloc.free(pEntropyBytes);
+      calloc.free(pDataIn);
+      calloc.free(pInBytes);
+    }
+  }
+
+  /// Windows DPAPI로 보호된 Blob(예: Yes24eBook.realm.key / .key.m)을 복호화하여 원시 바이트를 반환합니다.
+  static Future<Uint8List?> decryptWindowsDpapiBlob(
+    Uint8List blobBytes, {
+    String entropy = _yes24RealmEntropy,
+  }) async {
+    if (!Platform.isWindows || blobBytes.isEmpty) return null;
+
+    // 1. Win32 CryptUnprotectData FFI 직접 호출
+    try {
+      final ffiResult = _decryptWindowsDpapiBlobFfi(blobBytes, entropy);
+      if (ffiResult != null && ffiResult.isNotEmpty) {
+        return ffiResult;
+      }
+    } catch (_) {}
+
+    // 2. 폴백: PowerShell ProtectedData.Unprotect (메모리 Base64 전달, CurrentUser -> LocalMachine 순차 시도)
+    try {
+      final b64Blob = base64Encode(blobBytes);
+      final escapedEntropy = entropy.replaceAll("'", "''");
+      final psScript = '''
+\$ProgressPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Security
+try {
+  \$b = [System.Convert]::FromBase64String('$b64Blob')
+  \$e = [System.Text.Encoding]::UTF8.GetBytes('$escapedEntropy')
+  \$k = \$null
+  try {
+    \$k = [System.Security.Cryptography.ProtectedData]::Unprotect(\$b, \$e, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+  } catch {
+    try {
+      \$k = [System.Security.Cryptography.ProtectedData]::Unprotect(\$b, \$e, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
+    } catch {}
+  }
+  if (\$k -and \$k.Length -gt 0) {
+    Write-Output [System.Convert]::ToBase64String(\$k)
+  }
+} catch {}
+''';
+
+      final encoded = _encodePowerShellScript(psScript);
+      final procResult = await Process.run(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+        runInShell: true,
+      );
+
+      if (procResult.exitCode == 0) {
+        final out = procResult.stdout.toString().trim();
+        if (out.isNotEmpty) {
+          final decoded = base64Decode(out);
+          if (decoded.isNotEmpty) return decoded;
+        }
+      }
+    } catch (_) {}
+
+    return null;
+  }
+
+  /// Yes24 키 바이트(원본 64B, 128자리 Hex, 88자리 Base64 또는 Windows DPAPI Blob)를 복호화해 Base64 64바이트 키 문자열로 반환합니다.
+  static Future<String?> decryptYes24KeyBytes(Uint8List bytes) async {
+    if (bytes.isEmpty) return null;
+
+    if (bytes.length == 64) {
+      return base64Encode(bytes);
+    }
+
+    final text = utf8.decode(bytes, allowMalformed: true).trim();
+    if (RegExp(r'^[0-9a-fA-F]{128}$').hasMatch(text)) {
+      final hexBytes = Uint8List(64);
+      for (int i = 0; i < 64; i++) {
+        hexBytes[i] = int.parse(text.substring(i * 2, i * 2 + 2), radix: 16);
+      }
+      return base64Encode(hexBytes);
+    }
+
+    final b64Match = RegExp(r'[A-Za-z0-9+/]{86}==').firstMatch(text);
+    if (b64Match != null) {
+      try {
+        final b64Str = b64Match.group(0)!;
+        if (base64Decode(b64Str).length == 64) {
+          return b64Str;
+        }
+      } catch (_) {}
+    }
+
+    final decrypted = await decryptWindowsDpapiBlob(bytes);
+    if (decrypted != null && decrypted.length == 64) {
+      return base64Encode(decrypted);
+    }
+
+    return null;
   }
 
   /// 예스24 Realm 암호화 키(.key / .key.m)를 확인하고 DPAPI 복호화하여 Base64 문자열로 반환
   static Future<String?> getYes24DecryptedKey([String? realmPath]) async {
-    if (_cachedYes24DecryptedKey != null && _cachedYes24DecryptedKey!.isNotEmpty) {
-      return _cachedYes24DecryptedKey;
+    final cacheKey = (realmPath ?? '').trim();
+    final cached = _cachedYes24DecryptedKeys[cacheKey];
+    if (cached != null && cached.isNotEmpty) {
+      return cached;
     }
 
     final appData = Platform.environment['APPDATA'] ?? '';
     final rawCandidates = <String>[];
-    if (realmPath != null && realmPath.trim().isNotEmpty) {
-      rawCandidates.add('$realmPath.key');
-      rawCandidates.add('$realmPath.key.m');
-      rawCandidates.add(p.join(p.dirname(realmPath), 'Yes24eBook.realm.key'));
-      rawCandidates.add(p.join(p.dirname(realmPath), 'Yes24eBook.realm.key.m'));
+    if (cacheKey.isNotEmpty) {
+      final lower = cacheKey.toLowerCase();
+      if (lower.endsWith('.key') || lower.endsWith('.key.m')) {
+        rawCandidates.add(cacheKey);
+      }
+      rawCandidates.add('$cacheKey.key');
+      rawCandidates.add('$cacheKey.key.m');
+      rawCandidates.add(p.join(p.dirname(cacheKey), 'Yes24eBook.realm.key'));
+      rawCandidates.add(p.join(p.dirname(cacheKey), 'Yes24eBook.realm.key.m'));
     }
     if (appData.isNotEmpty) {
       rawCandidates.add(p.join(appData, 'Yes24eBook', '.db', 'Yes24eBook.realm.key'));
@@ -377,79 +569,13 @@ class FolderScanner {
 
     if (existingPaths.isEmpty) return null;
 
-    // 1. 평문 64바이트 / 128자리 Hex / 88자리 Base64 키 우선 확인
     for (final kp in existingPaths) {
       try {
         final bytes = await File(kp).readAsBytes();
-        if (bytes.length == 64) {
-          final b64 = base64Encode(bytes);
-          _cachedYes24DecryptedKey = b64;
-          return b64;
-        }
-        final text = utf8.decode(bytes, allowMalformed: true).trim();
-        if (RegExp(r'^[0-9a-fA-F]{128}$').hasMatch(text)) {
-          final hexBytes = Uint8List(64);
-          for (int i = 0; i < 64; i++) {
-            hexBytes[i] = int.parse(text.substring(i * 2, i * 2 + 2), radix: 16);
-          }
-          final b64 = base64Encode(hexBytes);
-          _cachedYes24DecryptedKey = b64;
-          return b64;
-        }
-        final b64Match = RegExp(r'[A-Za-z0-9+/]{86}==').firstMatch(text);
-        if (b64Match != null) {
-          final b64 = b64Match.group(0)!;
-          _cachedYes24DecryptedKey = b64;
-          return b64;
-        }
-      } catch (_) {}
-    }
-
-    // 2. Windows DPAPI(.key: CurrentUser / .key.m: LocalMachine) 복호화 시도
-    if (Platform.isWindows) {
-      try {
-        final quotedPaths = existingPaths
-            .map((e) => "'${e.replaceAll("'", "''")}'")
-            .join(', ');
-        final psScript = '''
-\$ProgressPreference = 'SilentlyContinue'
-Add-Type -AssemblyName System.Security
-\$e = [System.Text.Encoding]::UTF8.GetBytes('Yes24eBook.Realm.EncryptionKey')
-\$paths = @($quotedPaths)
-foreach (\$kp in \$paths) {
-  try {
-    if (-not (Test-Path -LiteralPath \$kp)) { continue }
-    \$b = [System.IO.File]::ReadAllBytes(\$kp)
-    \$k = \$null
-    try {
-      \$k = [System.Security.Cryptography.ProtectedData]::Unprotect(\$b, \$e, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-    } catch {
-      try {
-        \$k = [System.Security.Cryptography.ProtectedData]::Unprotect(\$b, \$e, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
-      } catch {}
-    }
-    if (\$k -and \$k.Length -eq 64) {
-      Write-Output [System.Convert]::ToBase64String(\$k)
-      break
-    }
-  } catch {}
-}
-''';
-
-        final encoded = _encodePowerShellScript(psScript);
-        final procResult = await Process.run(
-          'powershell',
-          ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-          runInShell: true,
-        );
-
-        if (procResult.exitCode == 0) {
-          final out = procResult.stdout.toString().trim();
-          final match = RegExp(r'[A-Za-z0-9+/]{86}==').firstMatch(out);
-          if (match != null) {
-            _cachedYes24DecryptedKey = match.group(0);
-            return _cachedYes24DecryptedKey;
-          }
+        final resolved = await decryptYes24KeyBytes(bytes);
+        if (resolved != null && resolved.isNotEmpty) {
+          _cachedYes24DecryptedKeys[cacheKey] = resolved;
+          return resolved;
         }
       } catch (_) {}
     }
